@@ -58,7 +58,8 @@ def main(_):
     os.makedirs(FLAGS.save_dir, exist_ok=True)
     flag_dict = get_flag_dict()
     with open(os.path.join(FLAGS.save_dir, 'flags.json'), 'w') as f:
-        json.dump(flag_dict, f)
+        json.dump(flag_dict, f, indent=4)
+        f.write('\n')
 
     # Make environment and datasets.
     config = FLAGS.agent
