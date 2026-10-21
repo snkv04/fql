@@ -83,18 +83,13 @@ def main(_):
 
     # Set up datasets.
     train_dataset = Dataset.create(**train_dataset)
-    if FLAGS.balanced_sampling:
-        # Create a separate replay buffer so that we can sample from both the training dataset and the replay buffer.
-        example_transition = {k: v[0] for k, v in train_dataset.items()}
-        replay_buffer = ReplayBuffer.create(example_transition, size=FLAGS.buffer_size)
-    else:
-        # Use the training dataset as the replay buffer.
-        train_dataset = ReplayBuffer.create_from_initial_dataset(
-            dict(train_dataset), size=max(FLAGS.buffer_size, train_dataset.size + 1)
-        )
-        replay_buffer = train_dataset
+    example_transition = {k: v[0] for k, v in train_dataset.items()}
+    online_buffer = ReplayBuffer.create(example_transition, size=FLAGS.buffer_size)
+    combined_buffer = ReplayBuffer.create_from_initial_dataset(
+        dict(train_dataset), size=max(FLAGS.buffer_size, train_dataset.size + 1)
+    )
     # Set p_aug and frame_stack.
-    for dataset in [train_dataset, val_dataset, replay_buffer]:
+    for dataset in [train_dataset, val_dataset, online_buffer, combined_buffer]:
         if dataset is not None:
             dataset.p_aug = FLAGS.p_aug
             dataset.frame_stack = FLAGS.frame_stack
@@ -151,16 +146,16 @@ def main(_):
                 # Adjust reward for D4RL antmaze.
                 reward = reward - 1.0
 
-            replay_buffer.add_transition(
-                dict(
-                    observations=ob,
-                    actions=action,
-                    rewards=reward,
-                    terminals=float(done),
-                    masks=1.0 - terminated,
-                    next_observations=next_ob,
-                )
+            transition = dict(
+                observations=ob,
+                actions=action,
+                rewards=reward,
+                terminals=float(done),
+                masks=1.0 - terminated,
+                next_observations=next_ob,
             )
+            online_buffer.add_transition(transition)
+            combined_buffer.add_transition(transition)
             ob = next_ob
 
             if done:
@@ -170,12 +165,12 @@ def main(_):
 
             # Update agent.
             if FLAGS.balanced_sampling:
-                # Half-and-half sampling from the training dataset and the replay buffer.
+                # Half-and-half sampling from the offline dataset and the online buffer.
                 dataset_batch = train_dataset.sample(config['batch_size'] // 2)
-                replay_batch = replay_buffer.sample(config['batch_size'] // 2)
-                batch = {k: np.concatenate([dataset_batch[k], replay_batch[k]], axis=0) for k in dataset_batch}
+                online_batch = online_buffer.sample(config['batch_size'] // 2)
+                batch = {k: np.concatenate([dataset_batch[k], online_batch[k]], axis=0) for k in dataset_batch}
             else:
-                batch = replay_buffer.sample(config['batch_size'])
+                batch = combined_buffer.sample(config['batch_size'])
 
             agent, update_info = update_agent(agent, batch, config, i)
 
