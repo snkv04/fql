@@ -49,6 +49,14 @@ flags.DEFINE_integer('balanced_sampling', 0, 'Whether to use balanced sampling f
 config_flags.DEFINE_config_file('agent', 'agents/fql.py', lock_config=False)
 
 
+def update_agent(agent, batch, config, i):
+    """Update the agent on a batch and return the new agent and update info."""
+    if config['agent_name'] == 'rebrac':
+        # ReBRAC updates the actor only every `actor_freq` steps.
+        return agent.update(batch, full_update=(i % config['actor_freq'] == 0))
+    return agent.update(batch)
+
+
 def main(_):
     # Set up logger.
     exp_name = get_exp_name(FLAGS.seed)
@@ -122,11 +130,7 @@ def main(_):
         if i <= FLAGS.offline_steps:
             # Offline RL.
             batch = train_dataset.sample(config['batch_size'])
-
-            if config['agent_name'] == 'rebrac':
-                agent, update_info = agent.update(batch, full_update=(i % config['actor_freq'] == 0))
-            else:
-                agent, update_info = agent.update(batch)
+            agent, update_info = update_agent(agent, batch, config, i)
         else:
             # Online fine-tuning.
             online_rng, key = jax.random.split(online_rng)
@@ -173,10 +177,7 @@ def main(_):
             else:
                 batch = replay_buffer.sample(config['batch_size'])
 
-            if config['agent_name'] == 'rebrac':
-                agent, update_info = agent.update(batch, full_update=(i % config['actor_freq'] == 0))
-            else:
-                agent, update_info = agent.update(batch)
+            agent, update_info = update_agent(agent, batch, config, i)
 
         # Log metrics.
         if i % FLAGS.log_interval == 0:
