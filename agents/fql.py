@@ -43,19 +43,24 @@ class FQLAgent(flax.struct.PyTreeNode):
             'q_min': q.min(),
         }
 
-    def actor_loss(self, batch, grad_params, rng):
-        """Compute the FQL actor loss."""
+    def actor_loss(self, batch, grad_params, rng, bc_batch=None):
+        """Compute the FQL actor loss.
+
+        The BC flow is trained on `bc_batch` (defaults to `batch`), and the one-step policy on `batch`.
+        """
+        bc_batch = batch if bc_batch is None else bc_batch
         batch_size, action_dim = batch['actions'].shape
+        bc_batch_size = bc_batch['actions'].shape[0]
         rng, x_rng, t_rng = jax.random.split(rng, 3)
 
         # BC flow loss.
-        x_0 = jax.random.normal(x_rng, (batch_size, action_dim))
-        x_1 = batch['actions']
-        t = jax.random.uniform(t_rng, (batch_size, 1))
+        x_0 = jax.random.normal(x_rng, (bc_batch_size, action_dim))
+        x_1 = bc_batch['actions']
+        t = jax.random.uniform(t_rng, (bc_batch_size, 1))
         x_t = (1 - t) * x_0 + t * x_1
         vel = x_1 - x_0
 
-        pred = self.network.select('actor_bc_flow')(batch['observations'], x_t, t, params=grad_params)
+        pred = self.network.select('actor_bc_flow')(bc_batch['observations'], x_t, t, params=grad_params)
         bc_flow_loss = jnp.mean((pred - vel) ** 2)
 
         # Distillation loss.
@@ -92,18 +97,23 @@ class FQLAgent(flax.struct.PyTreeNode):
         }
 
     @jax.jit
-    def total_loss(self, batch, grad_params, rng=None):
-        """Compute the total loss."""
+    def total_loss(self, batch, grad_params, rng=None, bc_batch=None, critic_batch=None):
+        """Compute the total loss.
+
+        The one-step policy is trained on `batch`. The BC flow and critic are trained on `bc_batch` and
+        `critic_batch`, respectively, which default to `batch`.
+        """
         info = {}
         rng = rng if rng is not None else self.rng
+        critic_batch = batch if critic_batch is None else critic_batch
 
         rng, actor_rng, critic_rng = jax.random.split(rng, 3)
 
-        critic_loss, critic_info = self.critic_loss(batch, grad_params, critic_rng)
+        critic_loss, critic_info = self.critic_loss(critic_batch, grad_params, critic_rng)
         for k, v in critic_info.items():
             info[f'critic/{k}'] = v
 
-        actor_loss, actor_info = self.actor_loss(batch, grad_params, actor_rng)
+        actor_loss, actor_info = self.actor_loss(batch, grad_params, actor_rng, bc_batch=bc_batch)
         for k, v in actor_info.items():
             info[f'actor/{k}'] = v
 
@@ -120,12 +130,12 @@ class FQLAgent(flax.struct.PyTreeNode):
         network.params[f'modules_target_{module_name}'] = new_target_params
 
     @jax.jit
-    def update(self, batch):
+    def update(self, batch, bc_batch=None, critic_batch=None):
         """Update the agent and return a new agent with information dictionary."""
         new_rng, rng = jax.random.split(self.rng)
 
         def loss_fn(grad_params):
-            return self.total_loss(batch, grad_params, rng=rng)
+            return self.total_loss(batch, grad_params, rng=rng, bc_batch=bc_batch, critic_batch=critic_batch)
 
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
         self.target_update(new_network, 'critic')

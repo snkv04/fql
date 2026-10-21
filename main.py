@@ -44,13 +44,43 @@ flags.DEFINE_bool('save_eval_data', True, 'Save evaluation trajectories and vide
 
 flags.DEFINE_float('p_aug', None, 'Probability of applying image augmentation.')
 flags.DEFINE_integer('frame_stack', None, 'Number of frames to stack.')
-flags.DEFINE_integer('balanced_sampling', 0, 'Whether to use balanced sampling for online fine-tuning.')
+flags.DEFINE_integer(
+    'balanced_sampling',
+    0,
+    'Whether to use balanced (half offline, half online) sampling for online fine-tuning, mainly for RLPD. '
+    'Overrides the *_finetuning_buffer flags.',
+)
+finetuning_buffer_names = ['offline', 'combined', 'online']
+flags.DEFINE_enum(
+    'actor_finetuning_buffer',
+    'combined',
+    finetuning_buffer_names,
+    'Buffer for the actor batch during online fine-tuning. For non-FQL agents, this batch is used for all updates.',
+)
+flags.DEFINE_enum(
+    'bc_finetuning_buffer',
+    'combined',
+    finetuning_buffer_names,
+    'Buffer for the FQL BC flow batch during online fine-tuning.',
+)
+flags.DEFINE_enum(
+    'critic_finetuning_buffer',
+    'combined',
+    finetuning_buffer_names,
+    'Buffer for the FQL critic batch during online fine-tuning.',
+)
 
 config_flags.DEFINE_config_file('agent', 'agents/fql.py', lock_config=False)
 
 
-def update_agent(agent, batch, config, i):
-    """Update the agent on a batch and return the new agent and update info."""
+def update_agent(agent, batch, config, i, bc_batch=None, critic_batch=None):
+    """Update the agent on a batch and return the new agent and update info.
+
+    For FQL, the BC flow and critic are trained on `bc_batch` and `critic_batch` (default: `batch`).
+    Other agents ignore `bc_batch` and `critic_batch`.
+    """
+    if config['agent_name'] == 'fql':
+        return agent.update(batch, bc_batch=bc_batch, critic_batch=critic_batch)
     if config['agent_name'] == 'rebrac':
         # ReBRAC updates the actor only every `actor_freq` steps.
         return agent.update(batch, full_update=(i % config['actor_freq'] == 0))
@@ -88,6 +118,7 @@ def main(_):
     combined_buffer = ReplayBuffer.create_from_initial_dataset(
         dict(train_dataset), size=max(FLAGS.buffer_size, train_dataset.size + 1)
     )
+    finetuning_buffers = dict(offline=train_dataset, combined=combined_buffer, online=online_buffer)
     # Set p_aug and frame_stack.
     for dataset in [train_dataset, val_dataset, online_buffer, combined_buffer]:
         if dataset is not None:
@@ -125,7 +156,7 @@ def main(_):
         if i <= FLAGS.offline_steps:
             # Offline RL.
             batch = train_dataset.sample(config['batch_size'])
-            agent, update_info = update_agent(agent, batch, config, i)
+            agent, update_info = update_agent(agent, batch, config, i, bc_batch=batch, critic_batch=batch)
         else:
             # Online fine-tuning.
             online_rng, key = jax.random.split(online_rng)
@@ -169,10 +200,21 @@ def main(_):
                 dataset_batch = train_dataset.sample(config['batch_size'] // 2)
                 online_batch = online_buffer.sample(config['batch_size'] // 2)
                 batch = {k: np.concatenate([dataset_batch[k], online_batch[k]], axis=0) for k in dataset_batch}
+                bc_batch = batch
+                critic_batch = batch
             else:
-                batch = combined_buffer.sample(config['batch_size'])
+                # Sample once per distinct buffer, so networks that use the same buffer share a batch.
+                buffer_names = [
+                    FLAGS.actor_finetuning_buffer,
+                    FLAGS.bc_finetuning_buffer,
+                    FLAGS.critic_finetuning_buffer,
+                ]
+                batches = {
+                    name: finetuning_buffers[name].sample(config['batch_size']) for name in dict.fromkeys(buffer_names)
+                }
+                batch, bc_batch, critic_batch = [batches[name] for name in buffer_names]
 
-            agent, update_info = update_agent(agent, batch, config, i)
+            agent, update_info = update_agent(agent, batch, config, i, bc_batch=bc_batch, critic_batch=critic_batch)
 
         # Log metrics.
         if i % FLAGS.log_interval == 0:
