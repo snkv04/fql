@@ -2,9 +2,11 @@ import os
 import platform
 
 import json
+import pickle
 import random
 import time
 
+import imageio
 import jax
 import numpy as np
 import tqdm
@@ -36,8 +38,9 @@ flags.DEFINE_integer('eval_interval', 100000, 'Evaluation interval.')
 flags.DEFINE_integer('save_interval', 1000000, 'Saving interval.')
 
 flags.DEFINE_integer('eval_episodes', 50, 'Number of evaluation episodes.')
-flags.DEFINE_integer('video_episodes', 0, 'Number of video episodes for each task.')
+flags.DEFINE_integer('video_episodes', 3, 'Number of video episodes for each task.')
 flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
+flags.DEFINE_bool('save_eval_data', True, 'Save evaluation trajectories and videos to save_dir.')
 
 flags.DEFINE_float('p_aug', None, 'Probability of applying image augmentation.')
 flags.DEFINE_integer('frame_stack', None, 'Number of frames to stack.')
@@ -210,6 +213,19 @@ def main(_):
 
             wandb.log(eval_metrics, step=i)
             eval_logger.log(eval_metrics, step=i)
+
+            # Save evaluation trajectories and videos.
+            if FLAGS.save_eval_data:
+                eval_dir = os.path.join(FLAGS.save_dir, 'eval')
+                os.makedirs(eval_dir, exist_ok=True)
+                with open(os.path.join(eval_dir, f'trajs_{i}.pkl'), 'wb') as f:
+                    pickle.dump(trajs, f)
+                # Use cur_renders, since get_wandb_video pads and adds borders to the entries of renders.
+                if len(cur_renders) > 0:
+                    video_dir = os.path.join(eval_dir, f'videos_{i}')
+                    os.makedirs(video_dir, exist_ok=True)
+                    for j, render in enumerate(cur_renders):
+                        imageio.mimwrite(os.path.join(video_dir, f'episode_{j}.mp4'), render, fps=15, macro_block_size=1)
 
         # Save agent.
         if i % FLAGS.save_interval == 0:

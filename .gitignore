@@ -6,3 +6,7 @@ dist/
 .DS_Store
 .idea/
 .ruff_cache/
+.venv
+exp/
+slurm_logs/
+slurm_scripts/
