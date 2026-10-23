@@ -80,6 +80,8 @@ class FQLAgent(flax.struct.PyTreeNode):
         if self.config['normalize_q_loss']:
             lam = jax.lax.stop_gradient(1 / jnp.abs(q).mean())
             q_loss = lam * q_loss
+        if not self.config['use_q_loss']:
+            q_loss = 0.0
 
         # Total loss.
         logging.info(f"alpha: {self.config['alpha']}")
@@ -275,6 +277,8 @@ def get_config():
             q_agg='mean',  # Aggregation method for target Q values.
             alpha=10.0,  # BC coefficient (need to be tuned for each environment).
             online_alpha=ml_collections.config_dict.placeholder(float),  # BC coefficient during online fine-tuning (None: use alpha).
+            use_q_loss=True,  # Whether to include the Q loss in the actor loss.
+            online_use_q_loss=ml_collections.config_dict.placeholder(bool),  # Q loss flag during online fine-tuning (None: use use_q_loss).
             flow_steps=10,  # Number of flow steps.
             normalize_q_loss=False,  # Whether to normalize the Q loss.
             encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).

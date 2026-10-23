@@ -160,9 +160,15 @@ def main(_):
             agent, update_info = update_agent(agent, batch, config, i, bc_batch=batch, critic_batch=batch)
         else:
             # Online fine-tuning.
-            if i == FLAGS.offline_steps + 1 and config['agent_name'] == 'fql' and config['online_alpha'] is not None:
-                # Switch to the online BC coefficient (the update is re-jitted since the config is static).
-                agent = agent.replace(config=agent.config.copy({'alpha': config['online_alpha']}))
+            if i == FLAGS.offline_steps + 1 and config['agent_name'] == 'fql':
+                online_overrides = {}
+                if config['online_alpha'] is not None:
+                    online_overrides['alpha'] = config['online_alpha']
+                if config['online_use_q_loss'] is not None:
+                    online_overrides['use_q_loss'] = config['online_use_q_loss']
+                if online_overrides:
+                    # Switch to the online config (the update is re-jitted since the config is static).
+                    agent = agent.replace(config=agent.config.copy(online_overrides))
 
             online_rng, key = jax.random.split(online_rng)
 
