@@ -11,7 +11,7 @@ import jax
 import numpy as np
 import tqdm
 import wandb
-from absl import app, flags
+from absl import app, flags, logging
 from ml_collections import config_flags
 
 from agents import agents
@@ -80,6 +80,7 @@ def update_agent(agent, batch, config, i, bc_batch=None, critic_batch=None):
     Other agents ignore `bc_batch` and `critic_batch`.
     """
     if config['agent_name'] == 'fql':
+        logging.info(f'Update step {i}')
         return agent.update(batch, bc_batch=bc_batch, critic_batch=critic_batch)
     if config['agent_name'] == 'rebrac':
         # ReBRAC updates the actor only every `actor_freq` steps.
@@ -159,6 +160,10 @@ def main(_):
             agent, update_info = update_agent(agent, batch, config, i, bc_batch=batch, critic_batch=batch)
         else:
             # Online fine-tuning.
+            if i == FLAGS.offline_steps + 1 and config['agent_name'] == 'fql' and config['online_alpha'] is not None:
+                # Switch to the online BC coefficient (the update is re-jitted since the config is static).
+                agent = agent.replace(config=agent.config.copy({'alpha': config['online_alpha']}))
+
             online_rng, key = jax.random.split(online_rng)
 
             if done:

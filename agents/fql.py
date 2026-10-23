@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import ml_collections
 import optax
+from absl import logging
 
 from utils.encoders import encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
@@ -81,6 +82,7 @@ class FQLAgent(flax.struct.PyTreeNode):
             q_loss = lam * q_loss
 
         # Total loss.
+        logging.info(f"alpha: {self.config['alpha']}")
         actor_loss = bc_flow_loss + self.config['alpha'] * distill_loss + q_loss
 
         # Additional metrics for logging.
@@ -272,6 +274,7 @@ def get_config():
             tau=0.005,  # Target network update rate.
             q_agg='mean',  # Aggregation method for target Q values.
             alpha=10.0,  # BC coefficient (need to be tuned for each environment).
+            online_alpha=ml_collections.config_dict.placeholder(float),  # BC coefficient during online fine-tuning (None: use alpha).
             flow_steps=10,  # Number of flow steps.
             normalize_q_loss=False,  # Whether to normalize the Q loss.
             encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
