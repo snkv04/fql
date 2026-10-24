@@ -50,6 +50,11 @@ flags.DEFINE_integer(
     'Whether to use balanced (half offline, half online) sampling for online fine-tuning, mainly for RLPD. '
     'Overrides the *_finetuning_buffer flags.',
 )
+flags.DEFINE_integer(
+    'utd_ratio',
+    1,
+    'Update-to-data ratio during online fine-tuning: number of updates (of all networks) per environment step.',
+)
 finetuning_buffer_names = ['offline', 'combined', 'online']
 flags.DEFINE_enum(
     'actor_finetuning_buffer',
@@ -105,6 +110,7 @@ def main(_):
     env, eval_env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name, frame_stack=FLAGS.frame_stack)
     if FLAGS.video_episodes > 0:
         assert 'singletask' in FLAGS.env_name, 'Rendering is currently only supported for OGBench environments.'
+    assert FLAGS.utd_ratio >= 1, 'UTD ratio must be a positive integer.'
     if FLAGS.online_steps > 0:
         assert 'visual' not in FLAGS.env_name, 'Online fine-tuning is currently not supported for visual environments.'
 
@@ -205,27 +211,31 @@ def main(_):
 
             step += 1
 
-            # Update agent.
-            if FLAGS.balanced_sampling:
-                # Half-and-half sampling from the offline dataset and the online buffer.
-                dataset_batch = train_dataset.sample(config['batch_size'] // 2)
-                online_batch = online_buffer.sample(config['batch_size'] // 2)
-                batch = {k: np.concatenate([dataset_batch[k], online_batch[k]], axis=0) for k in dataset_batch}
-                bc_batch = batch
-                critic_batch = batch
-            else:
-                # Sample once per distinct buffer, so networks that use the same buffer share a batch.
-                buffer_names = [
-                    FLAGS.actor_finetuning_buffer,
-                    FLAGS.bc_finetuning_buffer,
-                    FLAGS.critic_finetuning_buffer,
-                ]
-                batches = {
-                    name: finetuning_buffers[name].sample(config['batch_size']) for name in dict.fromkeys(buffer_names)
-                }
-                batch, bc_batch, critic_batch = [batches[name] for name in buffer_names]
+            # Update agent `utd_ratio` times, with fresh batches for each update.
+            for _ in range(FLAGS.utd_ratio):
+                if FLAGS.balanced_sampling:
+                    # Half-and-half sampling from the offline dataset and the online buffer.
+                    dataset_batch = train_dataset.sample(config['batch_size'] // 2)
+                    online_batch = online_buffer.sample(config['batch_size'] // 2)
+                    batch = {k: np.concatenate([dataset_batch[k], online_batch[k]], axis=0) for k in dataset_batch}
+                    bc_batch = batch
+                    critic_batch = batch
+                else:
+                    # Sample once per distinct buffer, so networks that use the same buffer share a batch.
+                    buffer_names = [
+                        FLAGS.actor_finetuning_buffer,
+                        FLAGS.bc_finetuning_buffer,
+                        FLAGS.critic_finetuning_buffer,
+                    ]
+                    batches = {
+                        name: finetuning_buffers[name].sample(config['batch_size'])
+                        for name in dict.fromkeys(buffer_names)
+                    }
+                    batch, bc_batch, critic_batch = [batches[name] for name in buffer_names]
 
-            agent, update_info = update_agent(agent, batch, config, i, bc_batch=bc_batch, critic_batch=critic_batch)
+                agent, update_info = update_agent(
+                    agent, batch, config, i, bc_batch=bc_batch, critic_batch=critic_batch
+                )
 
         # Log metrics.
         if i % FLAGS.log_interval == 0:
