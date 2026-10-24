@@ -55,6 +55,12 @@ flags.DEFINE_integer(
     1,
     'Update-to-data ratio during online fine-tuning: number of updates (of all networks) per environment step.',
 )
+flags.DEFINE_integer(
+    'warmup_steps',
+    0,
+    'Number of initial online steps (WSRL warm start) that only collect data with the pre-trained policy, '
+    'without updating the agent.',
+)
 finetuning_buffer_names = ['offline', 'combined', 'online']
 flags.DEFINE_enum(
     'actor_finetuning_buffer',
@@ -111,6 +117,13 @@ def main(_):
     if FLAGS.video_episodes > 0:
         assert 'singletask' in FLAGS.env_name, 'Rendering is currently only supported for OGBench environments.'
     assert FLAGS.utd_ratio >= 1, 'UTD ratio must be a positive integer.'
+    assert FLAGS.warmup_steps >= 0, 'Warmup steps must be a nonnegative integer.'
+    if FLAGS.warmup_steps > 0:
+        assert FLAGS.balanced_sampling or 'online' in [
+            FLAGS.actor_finetuning_buffer,
+            FLAGS.bc_finetuning_buffer,
+            FLAGS.critic_finetuning_buffer,
+        ], 'Warm start requires at least one network to use the online buffer.'
     if FLAGS.online_steps > 0:
         assert 'visual' not in FLAGS.env_name, 'Online fine-tuning is currently not supported for visual environments.'
 
@@ -211,8 +224,13 @@ def main(_):
 
             step += 1
 
+            # Warm start: only collect data with the pre-trained policy for the first `warmup_steps` online steps.
+            in_warmup = i - FLAGS.offline_steps <= FLAGS.warmup_steps
+            if in_warmup:
+                update_info = dict()
+
             # Update agent `utd_ratio` times, with fresh batches for each update.
-            for _ in range(FLAGS.utd_ratio):
+            for _ in range(0 if in_warmup else FLAGS.utd_ratio):
                 if FLAGS.balanced_sampling:
                     # Half-and-half sampling from the offline dataset and the online buffer.
                     dataset_batch = train_dataset.sample(config['batch_size'] // 2)
