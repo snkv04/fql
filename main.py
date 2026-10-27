@@ -185,6 +185,9 @@ def main(_):
                     online_overrides['alpha'] = config['online_alpha']
                 if config['online_use_q_loss'] is not None:
                     online_overrides['use_q_loss'] = config['online_use_q_loss']
+                for module_name in ['bc', 'actor', 'critic']:
+                    if config[f'freeze_{module_name}_online']:
+                        online_overrides[f'freeze_{module_name}'] = True
                 if online_overrides:
                     # Switch to the online config (the update is re-jitted since the config is static).
                     agent = agent.replace(config=agent.config.copy(online_overrides))

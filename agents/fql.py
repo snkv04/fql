@@ -34,7 +34,9 @@ class FQLAgent(flax.struct.PyTreeNode):
 
         target_q = batch['rewards'] + self.config['discount'] * batch['masks'] * next_q
 
-        q = self.network.select('critic')(batch['observations'], actions=batch['actions'], params=grad_params)
+        # A frozen critic is evaluated with its current params (no gradient) to keep the diagnostics.
+        critic_params = None if self.config['freeze_critic'] else grad_params
+        q = self.network.select('critic')(batch['observations'], actions=batch['actions'], params=critic_params)
         critic_loss = jnp.square(q - target_q).mean()
 
         return critic_loss, {
@@ -61,14 +63,17 @@ class FQLAgent(flax.struct.PyTreeNode):
         x_t = (1 - t) * x_0 + t * x_1
         vel = x_1 - x_0
 
-        pred = self.network.select('actor_bc_flow')(bc_batch['observations'], x_t, t, params=grad_params)
+        # Frozen networks are evaluated with their current params (no gradient) to keep the diagnostics.
+        bc_params = None if self.config['freeze_bc'] else grad_params
+        pred = self.network.select('actor_bc_flow')(bc_batch['observations'], x_t, t, params=bc_params)
         bc_flow_loss = jnp.mean((pred - vel) ** 2)
 
         # Distillation loss.
         rng, noise_rng = jax.random.split(rng)
         noises = jax.random.normal(noise_rng, (batch_size, action_dim))
         target_flow_actions = self.compute_flow_actions(batch['observations'], noises=noises)
-        actor_actions = self.network.select('actor_onestep_flow')(batch['observations'], noises, params=grad_params)
+        actor_params = None if self.config['freeze_actor'] else grad_params
+        actor_actions = self.network.select('actor_onestep_flow')(batch['observations'], noises, params=actor_params)
         distill_loss = jnp.mean((actor_actions - target_flow_actions) ** 2)
 
         # Q loss.
@@ -142,7 +147,21 @@ class FQLAgent(flax.struct.PyTreeNode):
             return self.total_loss(batch, grad_params, rng=rng, bc_batch=bc_batch, critic_batch=critic_batch)
 
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
-        self.target_update(new_network, 'critic')
+
+        # Restore the params of frozen modules, since Adam's momentum would otherwise keep updating them.
+        frozen_modules = []
+        if self.config['freeze_bc']:
+            frozen_modules += ['actor_bc_flow', 'actor_bc_flow_encoder']
+        if self.config['freeze_actor']:
+            frozen_modules += ['actor_onestep_flow']
+        if self.config['freeze_critic']:
+            frozen_modules += ['critic']
+        for module_name in frozen_modules:
+            if f'modules_{module_name}' in self.network.params:
+                new_network.params[f'modules_{module_name}'] = self.network.params[f'modules_{module_name}']
+
+        if not self.config['freeze_critic']:
+            self.target_update(new_network, 'critic')
 
         return self.replace(network=new_network, rng=new_rng), info
 
@@ -280,6 +299,12 @@ def get_config():
             use_q_loss=True,  # Whether to include the Q loss in the actor loss.
             online_use_q_loss=ml_collections.config_dict.placeholder(bool),  # Q loss flag during online fine-tuning (None: use use_q_loss).
             flow_steps=10,  # Number of flow steps.
+            freeze_bc_online=False,  # Whether to freeze the BC flow during online fine-tuning.
+            freeze_actor_online=False,  # Whether to freeze the one-step policy during online fine-tuning.
+            freeze_critic_online=False,  # Whether to freeze the critic (and target critic) during online fine-tuning.
+            freeze_bc=False,  # Whether the BC flow is frozen (set automatically from freeze_bc_online).
+            freeze_actor=False,  # Whether the one-step policy is frozen (set automatically from freeze_actor_online).
+            freeze_critic=False,  # Whether the critic is frozen (set automatically from freeze_critic_online).
             normalize_q_loss=False,  # Whether to normalize the Q loss.
             encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
         )
