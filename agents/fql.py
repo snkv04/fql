@@ -20,30 +20,91 @@ class FQLAgent(flax.struct.PyTreeNode):
     network: Any
     config: Any = nonpytree_field()
 
-    def critic_loss(self, batch, grad_params, rng):
-        """Compute the FQL critic loss."""
-        rng, sample_rng = jax.random.split(rng)
-        next_actions = self.sample_actions(batch['next_observations'], seed=sample_rng)
-        next_actions = jnp.clip(next_actions, -1, 1)
+    @staticmethod
+    def expectile_loss(adv, diff, expectile):
+        """Compute the expectile loss."""
+        weight = jnp.where(adv >= 0, expectile, (1 - expectile))
+        return weight * (diff**2)
 
-        next_qs = self.network.select('target_critic')(batch['next_observations'], actions=next_actions)
+    def value_loss(self, batch, grad_params):
+        """Compute the IQL value loss (only used with td_target='value')."""
+        q1, q2 = self.network.select('target_critic')(batch['observations'], actions=batch['actions'])
+        q = jnp.minimum(q1, q2)
+        # A frozen value network is evaluated with its current params (no gradient) to keep the diagnostics.
+        value_params = None if self.config['freeze_critic'] else grad_params
+        v = self.network.select('value')(batch['observations'], params=value_params)
+        value_loss = self.expectile_loss(q - v, q - v, self.config['expectile']).mean()
+
+        return value_loss, {
+            'value_loss': value_loss,
+            'v_mean': v.mean(),
+            'v_max': v.max(),
+            'v_min': v.min(),
+        }
+
+    def aggregate_qs(self, qs):
+        """Aggregate Q values over the critic ensemble (axis 0) according to `q_agg`."""
         if self.config['q_agg'] == 'min':
-            next_q = next_qs.min(axis=0)
+            return qs.min(axis=0)
+        return qs.mean(axis=0)
+
+    def critic_loss(self, batch, grad_params, rng):
+        """Compute the FQL critic loss.
+
+        The bootstrap value in the TD target depends on `td_target`:
+        - 'onestep': target Q of the one-step policy's action.
+        - 'flow_max': max over `critic_num_samples` BC flow actions of the (ensemble-aggregated) target Q.
+        - 'value': IQL value network.
+        """
+        info = {}
+        if self.config['td_target'] == 'onestep':
+            rng, sample_rng = jax.random.split(rng)
+            next_actions = self.sample_actions(batch['next_observations'], seed=sample_rng)
+            next_actions = jnp.clip(next_actions, -1, 1)
+
+            next_qs = self.network.select('target_critic')(batch['next_observations'], actions=next_actions)
+            next_q = self.aggregate_qs(next_qs)
+        elif self.config['td_target'] == 'flow_max':
+            rng, noise_rng = jax.random.split(rng)
+            batch_size = batch['next_observations'].shape[0]
+            num_samples = self.config['critic_num_samples']
+
+            # Sample `num_samples` actions per next observation from the BC flow. Observations are encoded once before
+            # being repeated, so that the encoder is not run `num_samples` times on the same observation.
+            flow_observations = batch['next_observations']
+            if self.config['encoder'] is not None:
+                flow_observations = self.network.select('actor_bc_flow_encoder')(flow_observations)
+            flow_observations = jnp.repeat(flow_observations, num_samples, axis=0)
+            noises = jax.random.normal(noise_rng, (batch_size * num_samples, self.config['action_dim']))
+            next_actions = self.integrate_flow(flow_observations, noises)
+
+            # Aggregate over the ensemble for each candidate, then take the max over candidates (as in EMaQ).
+            n_next_observations = jnp.repeat(batch['next_observations'], num_samples, axis=0)
+            next_qs = self.network.select('target_critic')(n_next_observations, actions=next_actions)
+            next_qs = self.aggregate_qs(next_qs).reshape(batch_size, num_samples)
+            next_q = next_qs.max(axis=-1)
+            info['next_q_max_minus_mean'] = (next_q - next_qs.mean(axis=-1)).mean()
         else:
-            next_q = next_qs.mean(axis=0)
+            next_q = self.network.select('value')(batch['next_observations'])
 
         target_q = batch['rewards'] + self.config['discount'] * batch['masks'] * next_q
 
         # A frozen critic is evaluated with its current params (no gradient) to keep the diagnostics.
         critic_params = None if self.config['freeze_critic'] else grad_params
         q = self.network.select('critic')(batch['observations'], actions=batch['actions'], params=critic_params)
-        critic_loss = jnp.square(q - target_q).mean()
+        if self.config['td_target'] == 'value':
+            # Sum (rather than average) over the ensemble, as in IQL.
+            critic_loss = jnp.square(q - target_q).sum(axis=0).mean()
+        else:
+            critic_loss = jnp.square(q - target_q).mean()
 
         return critic_loss, {
             'critic_loss': critic_loss,
             'q_mean': q.mean(),
             'q_max': q.max(),
             'q_min': q.min(),
+            'target_q_mean': target_q.mean(),
+            **info,
         }
 
     def actor_loss(self, batch, grad_params, rng, bc_batch=None):
@@ -118,6 +179,14 @@ class FQLAgent(flax.struct.PyTreeNode):
 
         rng, actor_rng, critic_rng = jax.random.split(rng, 3)
 
+        if self.config['td_target'] == 'value':
+            # The value network is trained on the same batch as the critic.
+            value_loss, value_info = self.value_loss(critic_batch, grad_params)
+            for k, v in value_info.items():
+                info[f'value/{k}'] = v
+        else:
+            value_loss = 0.0
+
         critic_loss, critic_info = self.critic_loss(critic_batch, grad_params, critic_rng)
         for k, v in critic_info.items():
             info[f'critic/{k}'] = v
@@ -126,7 +195,7 @@ class FQLAgent(flax.struct.PyTreeNode):
         for k, v in actor_info.items():
             info[f'actor/{k}'] = v
 
-        loss = critic_loss + actor_loss
+        loss = value_loss + critic_loss + actor_loss
         return loss, info
 
     def target_update(self, network, module_name):
@@ -155,7 +224,7 @@ class FQLAgent(flax.struct.PyTreeNode):
         if self.config['freeze_actor']:
             frozen_modules += ['actor_onestep_flow']
         if self.config['freeze_critic']:
-            frozen_modules += ['critic']
+            frozen_modules += ['critic', 'value']
         for module_name in frozen_modules:
             if f'modules_{module_name}' in self.network.params:
                 new_network.params[f'modules_{module_name}'] = self.network.params[f'modules_{module_name}']
@@ -194,6 +263,10 @@ class FQLAgent(flax.struct.PyTreeNode):
         """Compute actions from the BC flow model using the Euler method."""
         if self.config['encoder'] is not None:
             observations = self.network.select('actor_bc_flow_encoder')(observations)
+        return self.integrate_flow(observations, noises)
+
+    def integrate_flow(self, observations, noises):
+        """Integrate the BC flow from `noises` with the Euler method, given already encoded observations."""
         actions = noises
         # Euler method.
         for i in range(self.config['flow_steps']):
@@ -226,10 +299,22 @@ class FQLAgent(flax.struct.PyTreeNode):
         ob_dims = ex_observations.shape[1:]
         action_dim = ex_actions.shape[-1]
 
+        assert config['td_target'] in ['onestep', 'flow_max', 'value'], f'Unsupported TD target: {config["td_target"]}'
+        if config['td_target'] == 'value':
+            # The value network is always trained toward the min over the target critic, as in IQL.
+            assert config['q_agg'] in [None, 'min'], "q_agg is not configurable with td_target='value'."
+            config['q_agg'] = 'min'
+        elif config['q_agg'] is None:
+            config['q_agg'] = 'min' if config['td_target'] == 'flow_max' else 'mean'
+        assert config['q_agg'] in ['min', 'mean'], f'Unsupported q_agg: {config["q_agg"]}'
+        use_value = config['td_target'] == 'value'
+
         # Define encoders.
         encoders = dict()
         if config['encoder'] is not None:
             encoder_module = encoder_modules[config['encoder']]
+            if use_value:
+                encoders['value'] = encoder_module()
             encoders['critic'] = encoder_module()
             encoders['actor_bc_flow'] = encoder_module()
             encoders['actor_onestep_flow'] = encoder_module()
@@ -260,6 +345,14 @@ class FQLAgent(flax.struct.PyTreeNode):
             actor_bc_flow=(actor_bc_flow_def, (ex_observations, ex_actions, ex_times)),
             actor_onestep_flow=(actor_onestep_flow_def, (ex_observations, ex_actions)),
         )
+        if use_value:
+            value_def = Value(
+                hidden_dims=config['value_hidden_dims'],
+                layer_norm=config['layer_norm'],
+                num_ensembles=1,
+                encoder=encoders.get('value'),
+            )
+            network_info['value'] = (value_def, (ex_observations,))
         if encoders.get('actor_bc_flow') is not None:
             # Add actor_bc_flow_encoder to ModuleDict to make it separately callable.
             network_info['actor_bc_flow_encoder'] = (encoders.get('actor_bc_flow'), (ex_observations,))
@@ -293,7 +386,10 @@ def get_config():
             actor_layer_norm=False,  # Whether to use layer normalization for the actor.
             discount=0.99,  # Discount factor.
             tau=0.005,  # Target network update rate.
-            q_agg='mean',  # Aggregation method for target Q values.
+            q_agg=ml_collections.config_dict.placeholder(str),  # Aggregation method for target Q values (None: 'min' for 'flow_max', 'mean' for 'onestep'; must be None or 'min' for 'value').
+            td_target='onestep',  # Bootstrap value in the TD target ('onestep': one-step policy's action, 'flow_max': best of `critic_num_samples` BC flow actions, 'value': IQL value network).
+            critic_num_samples=32,  # Number of BC flow actions per next observation for td_target='flow_max'.
+            expectile=0.9,  # IQL expectile for td_target='value'.
             alpha=10.0,  # BC coefficient (need to be tuned for each environment).
             online_alpha=ml_collections.config_dict.placeholder(float),  # BC coefficient during online fine-tuning (None: use alpha).
             use_q_loss=True,  # Whether to include the Q loss in the actor loss.
