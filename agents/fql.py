@@ -28,8 +28,8 @@ class FQLAgent(flax.struct.PyTreeNode):
 
     def value_loss(self, batch, grad_params):
         """Compute the IQL value loss (only used with td_target='value')."""
-        q1, q2 = self.network.select('target_critic')(batch['observations'], actions=batch['actions'])
-        q = jnp.minimum(q1, q2)
+        qs = self.network.select('target_critic')(batch['observations'], actions=batch['actions'])
+        q = self.aggregate_qs(qs)
         # A frozen value network is evaluated with its current params (no gradient) to keep the diagnostics.
         value_params = None if self.config['freeze_critic'] else grad_params
         v = self.network.select('value')(batch['observations'], params=value_params)
@@ -300,12 +300,9 @@ class FQLAgent(flax.struct.PyTreeNode):
         action_dim = ex_actions.shape[-1]
 
         assert config['td_target'] in ['onestep', 'flow_max', 'value'], f'Unsupported TD target: {config["td_target"]}'
-        if config['td_target'] == 'value':
-            # The value network is always trained toward the min over the target critic, as in IQL.
-            assert config['q_agg'] in [None, 'min'], "q_agg is not configurable with td_target='value'."
-            config['q_agg'] = 'min'
-        elif config['q_agg'] is None:
-            config['q_agg'] = 'min' if config['td_target'] == 'flow_max' else 'mean'
+        if config['q_agg'] is None:
+            # Default to 'min' for 'flow_max' (as in EMaQ) and 'value' (as in IQL).
+            config['q_agg'] = 'mean' if config['td_target'] == 'onestep' else 'min'
         assert config['q_agg'] in ['min', 'mean'], f'Unsupported q_agg: {config["q_agg"]}'
         use_value = config['td_target'] == 'value'
 
@@ -386,7 +383,7 @@ def get_config():
             actor_layer_norm=False,  # Whether to use layer normalization for the actor.
             discount=0.99,  # Discount factor.
             tau=0.005,  # Target network update rate.
-            q_agg=ml_collections.config_dict.placeholder(str),  # Aggregation method for target Q values (None: 'min' for 'flow_max', 'mean' for 'onestep'; must be None or 'min' for 'value').
+            q_agg=ml_collections.config_dict.placeholder(str),  # Aggregation method for target Q values (None: 'mean' for 'onestep', 'min' for 'flow_max' and 'value').
             td_target='onestep',  # Bootstrap value in the TD target ('onestep': one-step policy's action, 'flow_max': best of `critic_num_samples` BC flow actions, 'value': IQL value network).
             critic_num_samples=32,  # Number of BC flow actions per next observation for td_target='flow_max'.
             expectile=0.9,  # IQL expectile for td_target='value'.
