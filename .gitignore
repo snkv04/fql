@@ -10,3 +10,4 @@ dist/
 exp/
 slurm_logs/
 slurm_scripts/
+wandb/

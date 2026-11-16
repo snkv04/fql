@@ -83,14 +83,17 @@ flags.DEFINE_enum(
 
 config_flags.DEFINE_config_file('agent', 'agents/fql.py', lock_config=False)
 
+# Agents that share FQL's update signature and online fine-tuning options.
+FQL_AGENTS = ['fql', 'fql_plan']
+
 
 def update_agent(agent, batch, config, i, bc_batch=None, critic_batch=None):
     """Update the agent on a batch and return the new agent and update info.
 
-    For FQL, the BC flow and critic are trained on `bc_batch` and `critic_batch` (default: `batch`).
+    For FQL (and FQL-plan), the BC flow and critic are trained on `bc_batch` and `critic_batch` (default: `batch`).
     Other agents ignore `bc_batch` and `critic_batch`.
     """
-    if config['agent_name'] == 'fql':
+    if config['agent_name'] in FQL_AGENTS:
         logging.info(f'Update step {i}')
         return agent.update(batch, bc_batch=bc_batch, critic_batch=critic_batch)
     if config['agent_name'] == 'rebrac':
@@ -157,6 +160,9 @@ def main(_):
         example_batch['actions'],
         config,
     )
+    if config['agent_name'] == 'fql_plan':
+        # Normalization statistics of the dynamics model.
+        agent = agent.set_dynamics_stats(train_dataset)
 
     # Restore agent.
     if FLAGS.restore_path is not None:
@@ -179,7 +185,7 @@ def main(_):
             agent, update_info = update_agent(agent, batch, config, i, bc_batch=batch, critic_batch=batch)
         else:
             # Online fine-tuning.
-            if i == FLAGS.offline_steps + 1 and config['agent_name'] == 'fql':
+            if i == FLAGS.offline_steps + 1 and config['agent_name'] in FQL_AGENTS:
                 online_overrides = {}
                 if config['online_alpha'] is not None:
                     online_overrides['alpha'] = config['online_alpha']
