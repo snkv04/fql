@@ -238,6 +238,7 @@ def main(_):
 
     output = FLAGS.output or os.path.join(FLAGS.run_dir, 'eval_plan.csv')
     rows = read_rows(output)
+    logging.info('Results CSV: %s (%d existing rows).', os.path.abspath(output), len(rows))
     done_keys = {tuple(row[k] for k in KEY_FIELDS) for row in rows}
 
     eval_env, agent = make_env_and_agent(train_flags, config)
@@ -252,6 +253,18 @@ def main(_):
 
     # Keep one W&B run open for all checkpoints (logged points are uploaded as they are logged).
     with init_wandb(train_flags, FLAGS.run_dir, setting) if FLAGS.wandb else contextlib.nullcontext() as run:
+        if run is not None:
+            logging.info(
+                'W&B run: %s (project %s, group %s, name %s, %s).',
+                run.url,
+                run.project,
+                run.group,
+                run.name,
+                'resumed' if run.resumed else 'new',
+            )
+        else:
+            logging.info('W&B logging is disabled, so videos are not rendered.')
+
         for step in steps:
             print(f'Step {step}: H={horizon}, N={num_samples}, score={planning_score}, execute={plan_execute_steps}')
 
@@ -270,6 +283,12 @@ def main(_):
                 if renders:
                     metrics['video'] = get_wandb_video(renders=renders)
                 run.log(metrics, step=step)
+            logging.info(
+                'Step %d: wrote a row to %s%s.',
+                step,
+                output,
+                f' and logged {"metrics and a video" if renders else "metrics"} to W&B at step {step}' if run else '',
+            )
             print({k: v for k, v in results.items() if 'success' in k or 'return' in k or k == 'plan_time_per_step'})
 
 
