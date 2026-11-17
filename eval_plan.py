@@ -1,14 +1,16 @@
-"""Evaluate saved FQL-plan checkpoints with a planning setting.
+"""Evaluate saved FQL-plan checkpoints of one or more training runs (e.g., seeds) with a planning setting.
 
 Example:
-    python eval_plan.py --run_dir=exp/fql/Debug/sd000_... --plan_horizon=3 --plan_samples=16
+    python eval_plan.py --run_dirs=exp/fql/Debug/<time>_job<id>_sd000,exp/fql/Debug/<time>_job<id>_sd001 --plan_horizon=3 --plan_samples=16
 
-Results are appended to <run_dir>/eval_plan.csv (one row per checkpoint and planning setting); checkpoints that are
-already in the CSV with this setting are skipped.
+The training runs are evaluated one after another. The results of all of them are appended to one CSV,
+<first run_dir>/<output> (one row per training run, checkpoint, and planning setting); checkpoints that are already in
+the CSV with this training run and setting are skipped.
 
-With --wandb, the planning setting is also logged to its own W&B run (group <run_group>-eval by default), with one
-point per checkpoint step. The run ID is derived from the training run, the planning setting, and the evaluation
-seed and episodes, so separate jobs and reruns log to the same run. Each checkpoint also logs a video of
+With --wandb, each training run is also logged to its own W&B run, with one point per checkpoint step. All of them are
+in the group <wandb_group_prefix>_H<plan_horizon>_N<plan_samples>, so that the training runs (seeds) of a planning
+setting are grouped together. The run ID is derived from the training run, the group, the planning setting, and the
+evaluation seed and episodes, so separate jobs and reruns log to the same run. Each checkpoint also logs a video of
 --video_episodes additional episodes (not included in the statistics).
 """
 
@@ -37,7 +39,7 @@ from utils.log_utils import get_wandb_video
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_string('run_dir', None, 'Training run directory (containing flags.json and params_*.pkl).')
+flags.DEFINE_list('run_dirs', None, 'Training run directories (each containing flags.json and params_*.pkl).')
 flags.DEFINE_list('steps', None, 'Checkpoint steps to evaluate (default: all saved checkpoints).')
 flags.DEFINE_integer('plan_horizon', 0, 'Planning horizon H.')
 flags.DEFINE_integer('plan_samples', 1, 'Number of candidates N.')
@@ -47,14 +49,21 @@ flags.DEFINE_integer('eval_episodes', 50, 'Number of evaluation episodes per set
 flags.DEFINE_integer('video_episodes', 3, 'Number of video episodes per checkpoint (logged to W&B only).')
 flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 flags.DEFINE_integer('seed', 0, 'Evaluation seed (the same episodes are used for every setting).')
-flags.DEFINE_string('output', None, 'Output CSV (default: <run_dir>/eval_plan.csv).')
-flags.DEFINE_bool('wandb', True, 'Whether to also log results to W&B (one run per planning setting).')
+flags.DEFINE_string(
+    'output', 'eval_plan.csv', 'Output CSV for all training runs (relative paths are relative to the first run directory).'
+)
+flags.DEFINE_bool('wandb', True, 'Whether to also log results to W&B (one run per training run and planning setting).')
 flags.DEFINE_string('wandb_project', 'fql', 'W&B project.')
-flags.DEFINE_string('wandb_group', None, 'W&B group (default: <run_group>-eval of the training run).')
+flags.DEFINE_string(
+    'wandb_group_prefix',
+    None,
+    'Prefix of the W&B group, which is <prefix>_H<plan_horizon>_N<plan_samples> (default: <run_group>-eval of the '
+    'training runs).',
+)
 
-flags.mark_flag_as_required('run_dir')
+flags.mark_flag_as_required('run_dirs')
 
-KEY_FIELDS = ['step', 'plan_horizon', 'plan_samples', 'planning_score', 'plan_execute_steps']
+KEY_FIELDS = ['run_dir', 'step', 'plan_horizon', 'plan_samples', 'planning_score', 'plan_execute_steps']
 
 
 def to_tuples(x):
@@ -143,23 +152,28 @@ def read_rows(output):
 def write_rows(output, rows):
     """Write all rows to the results CSV, with the union of their fields as the header."""
     fieldnames = list(dict.fromkeys(k for row in rows for k in row))
+    os.makedirs(os.path.dirname(output) or '.', exist_ok=True)
     with open(output, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
 
-def make_env_and_agent(train_flags, config):
-    """Make the evaluation environment and an agent template (its parameters are replaced by each checkpoint)."""
+def make_env(train_flags):
+    """Make the evaluation environment and an example batch (for creating agents)."""
     _, eval_env, train_dataset, _ = make_env_and_datasets(train_flags['env_name'], frame_stack=train_flags['frame_stack'])
     example_batch = Dataset.create(**train_dataset).sample(1)
-    agent = agents[config['agent_name']].create(
+    return eval_env, example_batch
+
+
+def make_agent(train_flags, config, example_batch):
+    """Make an agent template (its parameters are replaced by each checkpoint)."""
+    return agents[config['agent_name']].create(
         train_flags['seed'],
         example_batch['observations'],
         example_batch['actions'],
         config,
     )
-    return eval_env, agent
 
 
 def get_checkpoint_steps(run_dir, steps=None):
@@ -201,16 +215,16 @@ def with_plan_settings(agent, horizon, num_samples, planning_score, plan_execute
     )
 
 
-def init_wandb(train_flags, run_dir, setting):
-    """Create or resume the W&B run of a planning setting (one run for all of its checkpoints)."""
+def init_wandb(train_flags, run_dir, group, setting):
+    """Create or resume the W&B run of a training run and planning setting (one run for all of its checkpoints)."""
     horizon, num_samples, planning_score, plan_execute_steps = setting
     run_name = os.path.basename(os.path.normpath(run_dir))
-    id_source = '|'.join(map(str, [os.path.abspath(run_dir), *setting, FLAGS.seed, FLAGS.eval_episodes]))
+    id_source = '|'.join(map(str, [os.path.abspath(run_dir), group, *setting, FLAGS.seed, FLAGS.eval_episodes]))
     run_id = hashlib.md5(id_source.encode()).hexdigest()[:16]
 
     return wandb.init(
         project=FLAGS.wandb_project,
-        group=FLAGS.wandb_group or f'{train_flags["run_group"]}-eval',
+        group=group,
         name=f'{run_name}_H{horizon}_N{num_samples}_{planning_score}_x{plan_execute_steps}',
         id=run_id,
         resume='allow',
@@ -231,28 +245,23 @@ def init_wandb(train_flags, run_dir, setting):
     )
 
 
-def main(_):
-    train_flags, config = load_run_flags(FLAGS.run_dir)
-    if FLAGS.wandb and FLAGS.video_episodes > 0:
-        assert 'singletask' in train_flags['env_name'], 'Rendering is currently only supported for OGBench environments.'
+def evaluate_run(run_dir, train_flags, config, eval_env, example_batch, group, setting, output, rows):
+    """Evaluate the checkpoints of a training run that are not yet in the results CSV with the planning setting.
 
-    output = FLAGS.output or os.path.join(FLAGS.run_dir, 'eval_plan.csv')
-    rows = read_rows(output)
-    logging.info('Results CSV: %s (%d existing rows).', os.path.abspath(output), len(rows))
+    New rows are appended to `rows`, which are written to `output` after each checkpoint.
+    """
+    horizon, num_samples, planning_score, plan_execute_steps = setting
     done_keys = {tuple(row[k] for k in KEY_FIELDS) for row in rows}
 
-    eval_env, agent = make_env_and_agent(train_flags, config)
-    steps = get_checkpoint_steps(FLAGS.run_dir, FLAGS.steps)
-    setting = get_plan_setting(FLAGS.plan_horizon, FLAGS.plan_samples, FLAGS.planning_score, FLAGS.plan_execute_steps)
-    horizon, num_samples, planning_score, plan_execute_steps = setting
-
-    steps = [step for step in steps if tuple(str(k) for k in (step, *setting)) not in done_keys]
+    steps = get_checkpoint_steps(run_dir, FLAGS.steps)
+    steps = [step for step in steps if tuple(str(k) for k in (run_dir, step, *setting)) not in done_keys]
     if not steps:
-        print('All checkpoints are already evaluated with this setting.')
+        print(f'All checkpoints of {run_dir} are already evaluated with this setting.')
         return
+    agent = make_agent(train_flags, config, example_batch)
 
     # Keep one W&B run open for all checkpoints (logged points are uploaded as they are logged).
-    with init_wandb(train_flags, FLAGS.run_dir, setting) if FLAGS.wandb else contextlib.nullcontext() as run:
+    with init_wandb(train_flags, run_dir, group, setting) if FLAGS.wandb else contextlib.nullcontext() as run:
         if run is not None:
             logging.info(
                 'W&B run: %s (project %s, group %s, name %s, %s).',
@@ -266,9 +275,12 @@ def main(_):
             logging.info('W&B logging is disabled, so videos are not rendered.')
 
         for step in steps:
-            print(f'Step {step}: H={horizon}, N={num_samples}, score={planning_score}, execute={plan_execute_steps}')
+            print(
+                f'{run_dir}, step {step}: H={horizon}, N={num_samples}, score={planning_score}, '
+                f'execute={plan_execute_steps}'
+            )
 
-            step_agent = restore_agent(agent, FLAGS.run_dir, step)
+            step_agent = restore_agent(agent, run_dir, step)
             cell_agent = with_plan_settings(step_agent, *setting)
             # Videos are only logged to W&B, so skip rendering without it.
             num_video_episodes = FLAGS.video_episodes if FLAGS.wandb else 0
@@ -276,7 +288,9 @@ def main(_):
                 cell_agent, eval_env, FLAGS.eval_episodes, FLAGS.seed, num_video_episodes, FLAGS.video_frame_skip
             )
 
-            rows.append({**dict(zip(KEY_FIELDS, (step, *setting))), 'eval_episodes': FLAGS.eval_episodes, **results})
+            rows.append(
+                {**dict(zip(KEY_FIELDS, (run_dir, step, *setting))), 'eval_episodes': FLAGS.eval_episodes, **results}
+            )
             write_rows(output, rows)
             if run is not None:
                 metrics = {f'evaluation/{k}': v for k, v in results.items()}
@@ -290,6 +304,39 @@ def main(_):
                 f' and logged {"metrics and a video" if renders else "metrics"} to W&B at step {step}' if run else '',
             )
             print({k: v for k, v in results.items() if 'success' in k or 'return' in k or k == 'plan_time_per_step'})
+
+
+def main(_):
+    run_dirs = [os.path.abspath(run_dir) for run_dir in FLAGS.run_dirs]
+    run_flags = [load_run_flags(run_dir) for run_dir in run_dirs]
+
+    # The training runs share the evaluation environment (and the default W&B group prefix).
+    first_flags = run_flags[0][0]
+    for run_dir, (train_flags, _) in zip(run_dirs, run_flags):
+        for key in ['env_name', 'frame_stack'] + ([] if FLAGS.wandb_group_prefix else ['run_group']):
+            assert train_flags[key] == first_flags[key], (
+                f'{run_dir} has {key}={train_flags[key]}, but {run_dirs[0]} has {key}={first_flags[key]}.'
+            )
+    if FLAGS.wandb and FLAGS.video_episodes > 0:
+        assert 'singletask' in first_flags['env_name'], 'Rendering is currently only supported for OGBench environments.'
+
+    setting = get_plan_setting(FLAGS.plan_horizon, FLAGS.plan_samples, FLAGS.planning_score, FLAGS.plan_execute_steps)
+    horizon, num_samples = setting[:2]
+    group_prefix = FLAGS.wandb_group_prefix or f'{first_flags["run_group"]}-eval'
+    group = f'{group_prefix}_H{horizon}_N{num_samples}'
+
+    # The results of all training runs go to one CSV in the first run directory. Rows from before the CSV had a run_dir
+    # column were written by the run directory that the CSV is in.
+    output = os.path.join(run_dirs[0], FLAGS.output)
+    rows = [{'run_dir': run_dirs[0], **row} if not row.get('run_dir') else row for row in read_rows(output)]
+    logging.info(
+        'Evaluating checkpoints from %d training runs:\n%s', len(run_dirs), '\n'.join(f'  {d}' for d in run_dirs)
+    )
+    logging.info('Results CSV: %s (%d existing rows).', output, len(rows))
+
+    eval_env, example_batch = make_env(first_flags)
+    for run_dir, (train_flags, config) in zip(run_dirs, run_flags):
+        evaluate_run(run_dir, train_flags, config, eval_env, example_batch, group, setting, output, rows)
 
 
 if __name__ == '__main__':

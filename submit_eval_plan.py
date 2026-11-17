@@ -1,8 +1,8 @@
-"""Generate and submit Slurm scripts for test-time planning evaluation (eval_plan.py) of an FQL-plan run.
+"""Generate and submit Slurm scripts for test-time planning evaluation (eval_plan.py) of FQL-plan runs (e.g., seeds).
 
-One script is written to slurm_scripts/generated/ for each (plan_horizon, plan_samples) pair in the cartesian product.
-Each job writes its results to <run_dir>/eval_plan/H<horizon>_N<samples>.csv, so that concurrent jobs do not overwrite
-each other's results. Jobs are assigned to GPU_NODES in order, with at most JOBS_PER_NODE jobs per node.
+One script is written to slurm_scripts/generated/ for each (plan_horizon, plan_samples) pair in the cartesian product,
+and each job evaluates all of the training runs with its pair. Each job writes the results of all training runs to
+<first run_dir>/eval_plan/H<horizon>_N<samples>.csv, so that concurrent jobs do not overwrite each other's results. Jobs are assigned to GPU_NODES in order, with at most JOBS_PER_NODE jobs per node.
 """
 
 import glob
@@ -15,12 +15,12 @@ from absl import app, flags, logging
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_string('run_dir', None, 'Training run directory (containing flags.json and params_*.pkl).')
+flags.DEFINE_list('run_dirs', None, 'Training run directories (each containing flags.json and params_*.pkl).')
 flags.DEFINE_list('plan_horizons', None, 'Planning horizons H to evaluate.')
 flags.DEFINE_list('plan_samples', None, 'Numbers of candidates N to evaluate.')
 flags.DEFINE_bool('dry_run', False, 'Whether to only write the scripts without submitting them with sbatch.')
 
-flags.mark_flags_as_required(['run_dir', 'plan_horizons', 'plan_samples'])
+flags.mark_flags_as_required(['run_dirs', 'plan_horizons', 'plan_samples'])
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPT_DIR = os.path.join(REPO_DIR, 'slurm_scripts', 'generated')
@@ -63,7 +63,7 @@ export MUJOCO_PY_FORCE_CPU=1  # Use mujoco_py's CPU build on GPU nodes (only D4R
 export TMPDIR=/cs/data/people/svangaru/tmp  # Node-local /ltmp can be full
 mkdir -p "$TMPDIR"
 python eval_plan.py \\
-    --run_dir={run_dir} \\
+    --run_dirs={run_dirs} \\
     --plan_horizon={horizon} \\
     --plan_samples={num_samples} \\
     --output={output}
@@ -71,13 +71,15 @@ python eval_plan.py \\
 
 
 def check_run_dir(run_dir):
-    """Check that the run directory is an fql_plan run with saved checkpoints."""
+    """Check that the run directory is an fql_plan run with saved checkpoints, and return its run group."""
     flags_path = os.path.join(run_dir, 'flags.json')
     assert os.path.exists(flags_path), f'No flags.json in {run_dir}.'
     with open(flags_path) as f:
-        agent_name = json.load(f)['agent']['agent_name']
+        train_flags = json.load(f)
+    agent_name = train_flags['agent']['agent_name']
     assert agent_name == 'fql_plan', f'Expected an fql_plan run, got {agent_name}.'
     assert glob.glob(os.path.join(run_dir, 'params_*.pkl')), f'No checkpoints (params_*.pkl) in {run_dir}.'
+    return train_flags['run_group']
 
 
 def get_settings(horizons, samples):
@@ -92,9 +94,14 @@ def get_settings(horizons, samples):
 
 
 def main(_):
-    run_dir = os.path.abspath(FLAGS.run_dir)
-    check_run_dir(run_dir)
-    run_name = os.path.basename(os.path.normpath(run_dir))
+    run_dirs = [os.path.abspath(run_dir) for run_dir in FLAGS.run_dirs]
+    run_groups = {check_run_dir(run_dir) for run_dir in run_dirs}
+    if len(run_dirs) == 1:
+        run_name = os.path.basename(os.path.normpath(run_dirs[0]))
+    else:
+        # Name the scripts after the run group of the training runs (e.g., seeds).
+        assert len(run_groups) == 1, f'The training runs have different run groups: {sorted(run_groups)}.'
+        run_name = run_groups.pop()
 
     settings = get_settings([int(h) for h in FLAGS.plan_horizons], [int(n) for n in FLAGS.plan_samples])
     capacity = len(GPU_NODES) * JOBS_PER_NODE
@@ -108,7 +115,6 @@ def main(_):
 
     os.makedirs(SCRIPT_DIR, exist_ok=True)
     if not FLAGS.dry_run:
-        os.makedirs(os.path.join(run_dir, 'eval_plan'), exist_ok=True)
         os.makedirs(os.path.join(REPO_DIR, 'slurm_logs'), exist_ok=True)
 
     for j, (horizon, num_samples) in enumerate(settings):
@@ -121,10 +127,10 @@ def main(_):
         script = SCRIPT_TEMPLATE.format(
             repo_dir=REPO_DIR,
             node=node,
-            run_dir=run_dir,
+            run_dirs=','.join(run_dirs),
             horizon=horizon,
             num_samples=num_samples,
-            output=os.path.join(run_dir, 'eval_plan', f'{setting_name}.csv'),
+            output=os.path.join('eval_plan', f'{setting_name}.csv'),
         )
         with open(script_path, 'w') as f:
             f.write(script)
