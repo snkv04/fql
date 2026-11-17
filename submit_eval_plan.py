@@ -2,7 +2,8 @@
 
 One script is written to slurm_scripts/generated/ for each (plan_horizon, plan_samples) pair in the cartesian product,
 and each job evaluates all of the training runs with its pair. Each job writes the results of all training runs to
-<first run_dir>/eval_plan/H<horizon>_N<samples>.csv, so that concurrent jobs do not overwrite each other's results. Jobs are assigned to GPU_NODES in order, with at most JOBS_PER_NODE jobs per node.
+<first run_dir>/eval_plan/H<horizon>_N<samples>.csv, so that concurrent jobs do not overwrite each other's results.
+Jobs are assigned to the nodes in JOBS_PER_NODE in order, with at most the node's limit of jobs on each node.
 """
 
 import glob
@@ -25,8 +26,14 @@ flags.mark_flags_as_required(['run_dirs', 'plan_horizons', 'plan_samples'])
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPT_DIR = os.path.join(REPO_DIR, 'slurm_scripts', 'generated')
 
-GPU_NODES = ['gpu1601', 'gpu1602', 'gpu1603', 'gpu1604', 'gpu1605', 'gpu1901', 'gpu1902']
-JOBS_PER_NODE = 3  # Each job uses 1 GPU and 4 CPUs.
+# Maximum number of jobs per node, in the order that nodes are filled (each job uses 1 GPU, 4 CPUs, and 64G of memory).
+JOBS_PER_NODE = {
+    'gpu1601': 3,
+    'gpu1602': 3,
+    'gpu1603': 3,
+    'gpu1604': 3,
+    'gpu1605': 3,
+}
 
 SCRIPT_TEMPLATE = """#!/bin/bash
 
@@ -104,13 +111,15 @@ def main(_):
         run_name = run_groups.pop()
 
     settings = get_settings([int(h) for h in FLAGS.plan_horizons], [int(n) for n in FLAGS.plan_samples])
-    capacity = len(GPU_NODES) * JOBS_PER_NODE
-    if len(settings) > capacity:
+    # One slot per job that a node can run, filling each node up to its limit before moving on to the next.
+    slots = [node for node, limit in JOBS_PER_NODE.items() for _ in range(limit)]
+    assert slots, 'JOBS_PER_NODE has no job slots.'
+    if len(settings) > len(slots):
         logging.warning(
-            '%d jobs exceed the capacity of %d nodes x %d jobs per node; cycling through the nodes again.',
+            '%d jobs exceed the capacity of %d jobs (%s); cycling through the nodes again.',
             len(settings),
-            len(GPU_NODES),
-            JOBS_PER_NODE,
+            len(slots),
+            ', '.join(f'{node}: {limit}' for node, limit in JOBS_PER_NODE.items()),
         )
 
     os.makedirs(SCRIPT_DIR, exist_ok=True)
@@ -118,7 +127,7 @@ def main(_):
         os.makedirs(os.path.join(REPO_DIR, 'slurm_logs'), exist_ok=True)
 
     for j, (horizon, num_samples) in enumerate(settings):
-        node = GPU_NODES[(j // JOBS_PER_NODE) % len(GPU_NODES)]
+        node = slots[j % len(slots)]
         setting_name = f'H{horizon}_N{num_samples}'
         script_path = os.path.join(SCRIPT_DIR, f'eval_plan_{run_name}_{setting_name}.sh')
         if os.path.exists(script_path):
