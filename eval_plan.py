@@ -57,8 +57,8 @@ flags.DEFINE_string('wandb_project', 'fql', 'W&B project.')
 flags.DEFINE_string(
     'wandb_group_prefix',
     None,
-    'Prefix of the W&B group, which is <prefix>_H<plan_horizon>_N<plan_samples> (default: <run_group>-eval of the '
-    'training runs).',
+    'Prefix of the W&B group, which is <prefix>_H<plan_horizon>_N<plan_samples> (default: <name of the first run '
+    'directory>-eval).',
 )
 
 flags.mark_flag_as_required('run_dirs')
@@ -310,10 +310,10 @@ def main(_):
     run_dirs = [os.path.abspath(run_dir) for run_dir in FLAGS.run_dirs]
     run_flags = [load_run_flags(run_dir) for run_dir in run_dirs]
 
-    # The training runs share the evaluation environment (and the default W&B group prefix).
+    # The training runs share the evaluation environment.
     first_flags = run_flags[0][0]
     for run_dir, (train_flags, _) in zip(run_dirs, run_flags):
-        for key in ['env_name', 'frame_stack'] + ([] if FLAGS.wandb_group_prefix else ['run_group']):
+        for key in ['env_name', 'frame_stack']:
             assert train_flags[key] == first_flags[key], (
                 f'{run_dir} has {key}={train_flags[key]}, but {run_dirs[0]} has {key}={first_flags[key]}.'
             )
@@ -322,7 +322,7 @@ def main(_):
 
     setting = get_plan_setting(FLAGS.plan_horizon, FLAGS.plan_samples, FLAGS.planning_score, FLAGS.plan_execute_steps)
     horizon, num_samples = setting[:2]
-    group_prefix = FLAGS.wandb_group_prefix or f'{first_flags["run_group"]}-eval'
+    group_prefix = FLAGS.wandb_group_prefix or f'{os.path.basename(os.path.normpath(run_dirs[0]))}-eval'
     group = f'{group_prefix}_H{horizon}_N{num_samples}'
 
     # The results of all training runs go to one CSV in the first run directory. Rows from before the CSV had a run_dir
