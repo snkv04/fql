@@ -47,6 +47,13 @@ flags.DEFINE_bool(
     'Evaluate fql_plan with its planner (replanning at every step) instead of the one-step policy. Requires '
     '--agent.plan_horizon > 0 or --agent.plan_samples > 1, and --agent.plan_execute_steps=1.',
 )
+flags.DEFINE_bool(
+    'collect_with_planner',
+    False,
+    'Collect online data with fql_plan\'s planner (replanning at every step) instead of the one-step policy. Uses the '
+    'same planning setting as --eval_with_planner. Requires --agent.plan_horizon > 0 or --agent.plan_samples > 1, '
+    'and --agent.plan_execute_steps=1.',
+)
 
 flags.DEFINE_float('p_aug', None, 'Probability of applying image augmentation.')
 flags.DEFINE_integer('frame_stack', None, 'Number of frames to stack.')
@@ -106,6 +113,33 @@ def update_agent(agent, batch, config, i, bc_batch=None, critic_batch=None):
         # ReBRAC updates the actor only every `actor_freq` steps.
         return agent.update(batch, full_update=(i % config['actor_freq'] == 0))
     return agent.update(batch)
+
+
+def use_planner_for(flag_name, config):
+    """Return whether to select actions with fql_plan's planner for the given flag (--eval_with_planner or
+    --collect_with_planner), after checking that the agent's planning setting supports it.
+
+    The planner replans at every step, so it requires plan_execute_steps=1. With plan_horizon=0 and plan_samples=1, the
+    planner would only sample the one-step policy, so the one-step policy is used instead (with the same RNG usage as
+    without the flag).
+    """
+    if not FLAGS[flag_name].value:
+        return False
+    if config['agent_name'] != 'fql_plan':
+        raise ValueError(f'--{flag_name} requires --agent=agents/fql_plan.py, but got {config["agent_name"]}.')
+    if config['plan_execute_steps'] != 1:
+        raise ValueError(
+            f'--{flag_name} replans at every step, so it requires --agent.plan_execute_steps=1, but got '
+            f'--agent.plan_execute_steps={config["plan_execute_steps"]}. (eval_plan.py can evaluate saved checkpoints '
+            f'with plan_execute_steps > 1.)'
+        )
+    if config['plan_horizon'] == 0 and config['plan_samples'] == 1:
+        logging.warning(
+            f'--{flag_name} is set with --agent.plan_horizon=0 and --agent.plan_samples=1, so the planner is not used '
+            f'(it would only sample the one-step policy).'
+        )
+        return False
+    return True
 
 
 def main(_):
@@ -170,24 +204,14 @@ def main(_):
         # Normalization statistics of the dynamics model.
         agent = agent.set_dynamics_stats(train_dataset)
 
-    # Evaluate fql_plan with its planner if requested (otherwise, it is evaluated with the one-step policy like FQL).
-    use_planner = FLAGS.eval_with_planner
-    if use_planner:
-        if config['agent_name'] != 'fql_plan':
-            raise ValueError(f'--eval_with_planner requires --agent=agents/fql_plan.py, but got {config["agent_name"]}.')
-        if config['plan_execute_steps'] != 1:
-            raise ValueError(
-                f'--eval_with_planner replans at every step, so it requires --agent.plan_execute_steps=1, but got '
-                f'--agent.plan_execute_steps={config["plan_execute_steps"]}. Use eval_plan.py on the saved checkpoints '
-                f'to evaluate plan_execute_steps > 1.'
-            )
-        if config['plan_horizon'] == 0 and config['plan_samples'] == 1:
-            # The planner would only sample the one-step policy, so evaluate exactly as without the planner.
-            logging.warning(
-                '--eval_with_planner is set with --agent.plan_horizon=0 and --agent.plan_samples=1, so the planner is '
-                'not used (it would only sample the one-step policy).'
-            )
-            use_planner = False
+    # Evaluate and collect online data with fql_plan's planner if requested (otherwise, with the one-step policy like
+    # FQL). Both use the agent's planning setting (plan_horizon, plan_samples, planning_score).
+    eval_with_planner = use_planner_for('eval_with_planner', config)
+    collect_with_planner = use_planner_for('collect_with_planner', config)
+    if FLAGS.collect_with_planner and FLAGS.online_steps == 0:
+        logging.warning('--collect_with_planner has no effect without online steps (--online_steps=0).')
+    if FLAGS.eval_with_planner and FLAGS.eval_interval == 0:
+        logging.warning('--eval_with_planner has no effect without evaluation during training (--eval_interval=0).')
 
     # Restore agent.
     if FLAGS.restore_path is not None:
@@ -229,7 +253,10 @@ def main(_):
                 step = 0
                 ob, _ = env.reset()
 
-            action = agent.sample_actions(observations=ob, temperature=1, seed=key)
+            if collect_with_planner:
+                action = agent.plan_actions(ob, key)[0]
+            else:
+                action = agent.sample_actions(observations=ob, temperature=1, seed=key)
             action = np.array(action)
 
             next_ob, reward, terminated, truncated, info = env.step(action.copy())
@@ -314,7 +341,7 @@ def main(_):
                 num_eval_episodes=FLAGS.eval_episodes,
                 num_video_episodes=FLAGS.video_episodes,
                 video_frame_skip=FLAGS.video_frame_skip,
-                use_planner=use_planner,
+                use_planner=eval_with_planner,
             )
             renders.extend(cur_renders)
             for k, v in eval_info.items():
