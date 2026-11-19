@@ -41,6 +41,12 @@ flags.DEFINE_integer('eval_episodes', 50, 'Number of evaluation episodes.')
 flags.DEFINE_integer('video_episodes', 3, 'Number of video episodes for each task.')
 flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 flags.DEFINE_bool('save_eval_data', True, 'Save evaluation trajectories and videos to save_dir.')
+flags.DEFINE_bool(
+    'eval_with_planner',
+    False,
+    'Evaluate fql_plan with its planner (replanning at every step) instead of the one-step policy. Requires '
+    '--agent.plan_horizon > 0 or --agent.plan_samples > 1, and --agent.plan_execute_steps=1.',
+)
 
 flags.DEFINE_float('p_aug', None, 'Probability of applying image augmentation.')
 flags.DEFINE_integer('frame_stack', None, 'Number of frames to stack.')
@@ -164,14 +170,24 @@ def main(_):
         # Normalization statistics of the dynamics model.
         agent = agent.set_dynamics_stats(train_dataset)
 
-    # Evaluate fql_plan with its planner if planning is configured (otherwise, it is evaluated like FQL).
-    use_planner = config['agent_name'] == 'fql_plan' and (config['plan_horizon'] > 0 or config['plan_samples'] > 1)
-    if use_planner and config['plan_execute_steps'] != 1:
-        raise ValueError(
-            f'Evaluating fql_plan with the planner in main.py replans at every step, so it requires '
-            f'--agent.plan_execute_steps=1, but got --agent.plan_execute_steps={config["plan_execute_steps"]}. Use '
-            f'eval_plan.py on the saved checkpoints to evaluate plan_execute_steps > 1.'
-        )
+    # Evaluate fql_plan with its planner if requested (otherwise, it is evaluated with the one-step policy like FQL).
+    use_planner = FLAGS.eval_with_planner
+    if use_planner:
+        if config['agent_name'] != 'fql_plan':
+            raise ValueError(f'--eval_with_planner requires --agent=agents/fql_plan.py, but got {config["agent_name"]}.')
+        if config['plan_execute_steps'] != 1:
+            raise ValueError(
+                f'--eval_with_planner replans at every step, so it requires --agent.plan_execute_steps=1, but got '
+                f'--agent.plan_execute_steps={config["plan_execute_steps"]}. Use eval_plan.py on the saved checkpoints '
+                f'to evaluate plan_execute_steps > 1.'
+            )
+        if config['plan_horizon'] == 0 and config['plan_samples'] == 1:
+            # The planner would only sample the one-step policy, so evaluate exactly as without the planner.
+            logging.warning(
+                '--eval_with_planner is set with --agent.plan_horizon=0 and --agent.plan_samples=1, so the planner is '
+                'not used (it would only sample the one-step policy).'
+            )
+            use_planner = False
 
     # Restore agent.
     if FLAGS.restore_path is not None:
