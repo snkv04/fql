@@ -33,7 +33,7 @@ from tqdm import trange
 from agents import agents
 from envs.env_utils import make_env_and_datasets
 from utils.datasets import Dataset
-from utils.evaluation import add_to, flatten
+from utils.evaluation import add_to, average_stats, flatten
 from utils.flax_utils import restore_agent
 from utils.log_utils import get_wandb_video
 
@@ -127,7 +127,7 @@ def evaluate_planner(agent, env, num_episodes, seed, num_video_episodes=0, video
             add_to(stats, flatten(info))
             num_steps += step
 
-    results = {k: np.mean(v) for k, v in stats.items()}
+    results = average_stats(stats)
     results['plan_time_per_step'] = plan_time / num_steps
     return results, renders
 

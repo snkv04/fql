@@ -34,6 +34,20 @@ def add_to(dict_of_lists, single_dict):
         dict_of_lists[k].append(v)
 
 
+def average_stats(stats):
+    """Average per-episode statistics (lists of final-step info values) over episodes.
+
+    If the episodes have both a success flag and a return, this also adds `episode.success_return`, the average return
+    of the successful episodes only (NaN if no episode was successful).
+    """
+    results = {k: np.mean(v) for k, v in stats.items()}
+    if 'success' in stats and 'episode.return' in stats:
+        successes = np.array(stats['success'], dtype=bool)
+        returns = np.array(stats['episode.return'])
+        results['episode.success_return'] = returns[successes].mean() if successes.any() else np.nan
+    return results
+
+
 def evaluate(
     agent,
     env,
@@ -99,7 +113,4 @@ def evaluate(
         else:
             renders.append(np.array(render))
 
-    for k, v in stats.items():
-        stats[k] = np.mean(v)
-
-    return stats, trajs, renders
+    return average_stats(stats), trajs, renders
