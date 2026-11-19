@@ -164,6 +164,15 @@ def main(_):
         # Normalization statistics of the dynamics model.
         agent = agent.set_dynamics_stats(train_dataset)
 
+    # Evaluate fql_plan with its planner if planning is configured (otherwise, it is evaluated like FQL).
+    use_planner = config['agent_name'] == 'fql_plan' and (config['plan_horizon'] > 0 or config['plan_samples'] > 1)
+    if use_planner and config['plan_execute_steps'] != 1:
+        raise ValueError(
+            f'Evaluating fql_plan with the planner in main.py replans at every step, so it requires '
+            f'--agent.plan_execute_steps=1, but got --agent.plan_execute_steps={config["plan_execute_steps"]}. Use '
+            f'eval_plan.py on the saved checkpoints to evaluate plan_execute_steps > 1.'
+        )
+
     # Restore agent.
     if FLAGS.restore_path is not None:
         agent = restore_agent(agent, FLAGS.restore_path, FLAGS.restore_epoch)
@@ -289,6 +298,7 @@ def main(_):
                 num_eval_episodes=FLAGS.eval_episodes,
                 num_video_episodes=FLAGS.video_episodes,
                 video_frame_skip=FLAGS.video_frame_skip,
+                use_planner=use_planner,
             )
             renders.extend(cur_renders)
             for k, v in eval_info.items():

@@ -56,6 +56,7 @@ def evaluate(
     num_video_episodes=0,
     video_frame_skip=3,
     eval_temperature=0,
+    use_planner=False,
 ):
     """Evaluate the agent in the environment.
 
@@ -66,12 +67,30 @@ def evaluate(
         num_eval_episodes: Number of episodes to evaluate the agent.
         num_video_episodes: Number of episodes to render. These episodes are not included in the statistics.
         video_frame_skip: Number of frames to skip between renders.
-        eval_temperature: Action sampling temperature.
+        eval_temperature: Action sampling temperature (unused with the planner).
+        use_planner: Whether to select actions with the agent's planner (`plan_actions`), replanning at every step,
+            instead of `sample_actions`. The agent must plan one action at a time (`plan_execute_steps` = 1).
 
     Returns:
         A tuple containing the statistics, trajectories, and rendered videos.
     """
-    actor_fn = supply_rng(agent.sample_actions, rng=jax.random.PRNGKey(np.random.randint(0, 2**32)))
+    if use_planner:
+        if agent.config['plan_execute_steps'] != 1:
+            raise ValueError(
+                f'Evaluating with the planner replans at every step, so it requires plan_execute_steps=1, but got '
+                f'plan_execute_steps={agent.config["plan_execute_steps"]}. Use eval_plan.py to evaluate '
+                f'plan_execute_steps > 1.'
+            )
+
+        def plan_action(observations, seed, temperature=0):
+            # plan_actions returns the best candidate's first plan_execute_steps (= 1) actions;
+            # [0] drops the time axis.
+            return agent.plan_actions(observations, seed)[0]
+
+        action_fn = plan_action
+    else:
+        action_fn = agent.sample_actions
+    actor_fn = supply_rng(action_fn, rng=jax.random.PRNGKey(np.random.randint(0, 2**32)))
     trajs = []
     stats = defaultdict(list)
 
