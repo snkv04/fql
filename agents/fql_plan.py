@@ -60,7 +60,11 @@ class FQLPlanAgent(FQLAgent):
         else:
             target = (next_observations - self.obs_mean) / self.obs_std
 
-        pred = self.network.select('dynamics')(self.dynamics_inputs(observations, batch['actions']), params=grad_params)
+        # A frozen dynamics model is evaluated with its current params (no gradient) to keep the diagnostics.
+        dynamics_params = None if self.config['freeze_dynamics'] else grad_params
+        pred = self.network.select('dynamics')(
+            self.dynamics_inputs(observations, batch['actions']), params=dynamics_params
+        )
         dynamics_loss = jnp.mean((pred - target) ** 2)
 
         # MSE of the predicted next observations in the original (unnormalized) space, for logging.
@@ -88,6 +92,10 @@ class FQLPlanAgent(FQLAgent):
             info[f'dynamics/{k}'] = v
 
         return loss + dynamics_loss, info
+
+    def frozen_modules(self):
+        """Return the names of the network modules that are frozen (not updated)."""
+        return super().frozen_modules() + (['dynamics'] if self.config['freeze_dynamics'] else [])
 
     def aggregate_plan_qs(self, qs):
         """Aggregate Q values over the critic ensemble (axis 0) for scoring plans."""
@@ -195,6 +203,8 @@ def get_config():
     config.agent_name = 'fql_plan'  # Agent name.
     config.dynamics_hidden_dims = (512, 512, 512, 512)  # Dynamics model hidden dimensions.
     config.predict_delta = True  # Whether the dynamics model predicts s' - s (True) or s' (False).
+    config.freeze_dynamics_online = False  # Whether to freeze the dynamics model during online fine-tuning.
+    config.freeze_dynamics = False  # Whether the dynamics model is frozen (set automatically from freeze_dynamics_online).
     config.plan_horizon = 0  # Number of dynamics model steps per plan (0: best-of-N without the dynamics model).
     config.plan_samples = 1  # Number of candidates proposed by the one-step policy.
     config.planning_score = 'last'  # How to score rollouts ('last', 'best', or 'all').

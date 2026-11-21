@@ -253,7 +253,10 @@ def main(_):
                     online_overrides['alpha'] = config['online_alpha']
                 if config['online_use_q_loss'] is not None:
                     online_overrides['use_q_loss'] = config['online_use_q_loss']
-                for module_name in ['bc', 'actor', 'critic']:
+                module_names = ['bc', 'actor', 'critic']
+                if 'freeze_dynamics_online' in config:
+                    module_names.append('dynamics')  # fql_plan's dynamics model can also be frozen.
+                for module_name in module_names:
                     if config[f'freeze_{module_name}_online']:
                         online_overrides[f'freeze_{module_name}'] = True
                 if online_overrides:

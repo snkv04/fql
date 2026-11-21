@@ -207,6 +207,17 @@ class FQLAgent(flax.struct.PyTreeNode):
         )
         network.params[f'modules_target_{module_name}'] = new_target_params
 
+    def frozen_modules(self):
+        """Return the names of the network modules that are frozen (not updated)."""
+        frozen_modules = []
+        if self.config['freeze_bc']:
+            frozen_modules += ['actor_bc_flow', 'actor_bc_flow_encoder']
+        if self.config['freeze_actor']:
+            frozen_modules += ['actor_onestep_flow']
+        if self.config['freeze_critic']:
+            frozen_modules += ['critic', 'value']
+        return frozen_modules
+
     @jax.jit
     def update(self, batch, bc_batch=None, critic_batch=None):
         """Update the agent and return a new agent with information dictionary."""
@@ -218,14 +229,7 @@ class FQLAgent(flax.struct.PyTreeNode):
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
 
         # Restore the params of frozen modules, since Adam's momentum would otherwise keep updating them.
-        frozen_modules = []
-        if self.config['freeze_bc']:
-            frozen_modules += ['actor_bc_flow', 'actor_bc_flow_encoder']
-        if self.config['freeze_actor']:
-            frozen_modules += ['actor_onestep_flow']
-        if self.config['freeze_critic']:
-            frozen_modules += ['critic', 'value']
-        for module_name in frozen_modules:
+        for module_name in self.frozen_modules():
             if f'modules_{module_name}' in self.network.params:
                 new_network.params[f'modules_{module_name}'] = self.network.params[f'modules_{module_name}']
 
