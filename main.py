@@ -19,7 +19,15 @@ from envs.env_utils import make_env_and_datasets
 from utils.datasets import Dataset, ReplayBuffer
 from utils.evaluation import evaluate, flatten
 from utils.flax_utils import restore_agent, save_agent
-from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_video, setup_wandb
+from utils.log_utils import (
+    CsvLogger,
+    Timer,
+    get_exp_name,
+    get_flag_dict,
+    get_wandb_video,
+    save_timing_plot,
+    setup_wandb,
+)
 
 FLAGS = flags.FLAGS
 
@@ -222,6 +230,8 @@ def main(_):
     eval_logger = CsvLogger(os.path.join(FLAGS.save_dir, 'eval.csv'))
     first_time = time.time()
     last_time = time.time()
+    # Wall-clock time of the main parts of training (logged as cumulative seconds and fractions of the total time).
+    timer = Timer(['buffer_sample', 'update', 'act', 'env_reset', 'env_step', 'buffer_add', 'eval', 'log', 'save'])
 
     step = 0
     done = True
@@ -230,8 +240,11 @@ def main(_):
     for i in tqdm.tqdm(range(1, FLAGS.offline_steps + FLAGS.online_steps + 1), smoothing=0.1, dynamic_ncols=True):
         if i <= FLAGS.offline_steps:
             # Offline RL.
-            batch = train_dataset.sample(config['batch_size'])
-            agent, update_info = update_agent(agent, batch, config, i, bc_batch=batch, critic_batch=batch)
+            with timer('buffer_sample'):
+                batch = train_dataset.sample(config['batch_size'])
+            with timer('update'):
+                agent, update_info = update_agent(agent, batch, config, i, bc_batch=batch, critic_batch=batch)
+                jax.block_until_ready(update_info)  # Wait for the (asynchronous) update, so that it is timed here.
         else:
             # Online fine-tuning.
             if i == FLAGS.offline_steps + 1 and config['agent_name'] in FQL_AGENTS:
@@ -251,15 +264,18 @@ def main(_):
 
             if done:
                 step = 0
-                ob, _ = env.reset()
+                with timer('env_reset'):
+                    ob, _ = env.reset()
 
-            if collect_with_planner:
-                action = agent.plan_actions(ob, key)[0]
-            else:
-                action = agent.sample_actions(observations=ob, temperature=1, seed=key)
-            action = np.array(action)
+            with timer('act'):
+                if collect_with_planner:
+                    action = agent.plan_actions(ob, key)[0]
+                else:
+                    action = agent.sample_actions(observations=ob, temperature=1, seed=key)
+                action = np.array(action)  # Waits for the action, so that it is timed here.
 
-            next_ob, reward, terminated, truncated, info = env.step(action.copy())
+            with timer('env_step'):
+                next_ob, reward, terminated, truncated, info = env.step(action.copy())
             done = terminated or truncated
 
             if 'antmaze' in FLAGS.env_name and (
@@ -276,8 +292,9 @@ def main(_):
                 masks=1.0 - terminated,
                 next_observations=next_ob,
             )
-            online_buffer.add_transition(transition)
-            combined_buffer.add_transition(transition)
+            with timer('buffer_add'):
+                online_buffer.add_transition(transition)
+                combined_buffer.add_transition(transition)
             ob = next_ob
 
             if done:
@@ -292,84 +309,121 @@ def main(_):
 
             # Update agent `utd_ratio` times, with fresh batches for each update.
             for _ in range(0 if in_warmup else FLAGS.utd_ratio):
-                if FLAGS.balanced_sampling:
-                    # Half-and-half sampling from the offline dataset and the online buffer.
-                    dataset_batch = train_dataset.sample(config['batch_size'] // 2)
-                    online_batch = online_buffer.sample(config['batch_size'] // 2)
-                    batch = {k: np.concatenate([dataset_batch[k], online_batch[k]], axis=0) for k in dataset_batch}
-                    bc_batch = batch
-                    critic_batch = batch
-                else:
-                    # Sample once per distinct buffer, so networks that use the same buffer share a batch.
-                    buffer_names = [
-                        FLAGS.actor_finetuning_buffer,
-                        FLAGS.bc_finetuning_buffer,
-                        FLAGS.critic_finetuning_buffer,
-                    ]
-                    batches = {
-                        name: finetuning_buffers[name].sample(config['batch_size'])
-                        for name in dict.fromkeys(buffer_names)
-                    }
-                    batch, bc_batch, critic_batch = [batches[name] for name in buffer_names]
+                with timer('buffer_sample'):
+                    if FLAGS.balanced_sampling:
+                        # Half-and-half sampling from the offline dataset and the online buffer.
+                        dataset_batch = train_dataset.sample(config['batch_size'] // 2)
+                        online_batch = online_buffer.sample(config['batch_size'] // 2)
+                        batch = {
+                            k: np.concatenate([dataset_batch[k], online_batch[k]], axis=0) for k in dataset_batch
+                        }
+                        bc_batch = batch
+                        critic_batch = batch
+                    else:
+                        # Sample once per distinct buffer, so networks that use the same buffer share a batch.
+                        buffer_names = [
+                            FLAGS.actor_finetuning_buffer,
+                            FLAGS.bc_finetuning_buffer,
+                            FLAGS.critic_finetuning_buffer,
+                        ]
+                        batches = {
+                            name: finetuning_buffers[name].sample(config['batch_size'])
+                            for name in dict.fromkeys(buffer_names)
+                        }
+                        batch, bc_batch, critic_batch = [batches[name] for name in buffer_names]
 
-                agent, update_info = update_agent(
-                    agent, batch, config, i, bc_batch=bc_batch, critic_batch=critic_batch
-                )
+                with timer('update'):
+                    agent, update_info = update_agent(
+                        agent, batch, config, i, bc_batch=bc_batch, critic_batch=critic_batch
+                    )
+                    jax.block_until_ready(update_info)  # Wait for the (asynchronous) update, so that it is timed here.
 
         # Log metrics.
         if i % FLAGS.log_interval == 0:
-            train_metrics = {f'training/{k}': v for k, v in update_info.items()}
-            if val_dataset is not None:
-                val_batch = val_dataset.sample(config['batch_size'])
-                _, val_info = agent.total_loss(val_batch, grad_params=None)
-                train_metrics.update({f'validation/{k}': v for k, v in val_info.items()})
-            train_metrics['time/epoch_time'] = (time.time() - last_time) / FLAGS.log_interval
-            train_metrics['time/total_time'] = time.time() - first_time
-            train_metrics.update(expl_metrics)
-            last_time = time.time()
-            wandb.log(train_metrics, step=i)
-            train_logger.log(train_metrics, step=i)
+            with timer('log'):
+                train_metrics = {f'training/{k}': v for k, v in update_info.items()}
+                if val_dataset is not None:
+                    val_batch = val_dataset.sample(config['batch_size'])
+                    _, val_info = agent.total_loss(val_batch, grad_params=None)
+                    train_metrics.update({f'validation/{k}': v for k, v in val_info.items()})
+                train_metrics['time/epoch_time'] = (time.time() - last_time) / FLAGS.log_interval
+                train_metrics['time/total_time'] = time.time() - first_time
+                for name, total in timer.totals.items():
+                    train_metrics[f'time/{name}'] = total
+                    train_metrics[f'time/{name}_frac'] = total / train_metrics['time/total_time']
+                train_metrics.update(expl_metrics)
+                last_time = time.time()
+                wandb.log(train_metrics, step=i)
+                train_logger.log(train_metrics, step=i)
 
         # Evaluate agent.
         if FLAGS.eval_interval != 0 and (i == 1 or i % FLAGS.eval_interval == 0):
-            renders = []
-            eval_metrics = {}
-            eval_info, trajs, cur_renders = evaluate(
-                agent=agent,
-                env=eval_env,
-                config=config,
-                num_eval_episodes=FLAGS.eval_episodes,
-                num_video_episodes=FLAGS.video_episodes,
-                video_frame_skip=FLAGS.video_frame_skip,
-                use_planner=eval_with_planner,
-            )
-            renders.extend(cur_renders)
-            for k, v in eval_info.items():
-                eval_metrics[f'evaluation/{k}'] = v
+            with timer('eval'):
+                renders = []
+                eval_metrics = {}
+                eval_info, trajs, cur_renders = evaluate(
+                    agent=agent,
+                    env=eval_env,
+                    config=config,
+                    num_eval_episodes=FLAGS.eval_episodes,
+                    num_video_episodes=FLAGS.video_episodes,
+                    video_frame_skip=FLAGS.video_frame_skip,
+                    use_planner=eval_with_planner,
+                )
+                renders.extend(cur_renders)
+                for k, v in eval_info.items():
+                    eval_metrics[f'evaluation/{k}'] = v
 
-            if FLAGS.video_episodes > 0:
-                video = get_wandb_video(renders=renders)
-                eval_metrics['video'] = video
+                if FLAGS.video_episodes > 0:
+                    video = get_wandb_video(renders=renders)
+                    eval_metrics['video'] = video
 
-            wandb.log(eval_metrics, step=i)
-            eval_logger.log(eval_metrics, step=i)
+                wandb.log(eval_metrics, step=i)
+                eval_logger.log(eval_metrics, step=i)
 
-            # Save evaluation trajectories and videos.
-            if FLAGS.save_eval_data:
-                eval_dir = os.path.join(FLAGS.save_dir, 'eval')
-                os.makedirs(eval_dir, exist_ok=True)
-                with open(os.path.join(eval_dir, f'trajs_{i}.pkl'), 'wb') as f:
-                    pickle.dump(trajs, f)
-                # Use cur_renders, since get_wandb_video pads and adds borders to the entries of renders.
-                if len(cur_renders) > 0:
-                    video_dir = os.path.join(eval_dir, f'videos_{i}')
-                    os.makedirs(video_dir, exist_ok=True)
-                    for j, render in enumerate(cur_renders):
-                        imageio.mimwrite(os.path.join(video_dir, f'episode_{j}.mp4'), render, fps=15, macro_block_size=1)
+                # Save evaluation trajectories and videos.
+                if FLAGS.save_eval_data:
+                    eval_dir = os.path.join(FLAGS.save_dir, 'eval')
+                    os.makedirs(eval_dir, exist_ok=True)
+                    with open(os.path.join(eval_dir, f'trajs_{i}.pkl'), 'wb') as f:
+                        pickle.dump(trajs, f)
+                    # Use cur_renders, since get_wandb_video pads and adds borders to the entries of renders.
+                    if len(cur_renders) > 0:
+                        video_dir = os.path.join(eval_dir, f'videos_{i}')
+                        os.makedirs(video_dir, exist_ok=True)
+                        for j, render in enumerate(cur_renders):
+                            imageio.mimwrite(os.path.join(video_dir, f'episode_{j}.mp4'), render, fps=15, macro_block_size=1)
 
         # Save agent.
         if i % FLAGS.save_interval == 0:
-            save_agent(agent, FLAGS.save_dir, i)
+            with timer('save'):
+                save_agent(agent, FLAGS.save_dir, i)
+
+    # Save a bar graph of the wall-clock time of each section.
+    total_time = time.time() - first_time
+    timing_plot_path = os.path.join(FLAGS.save_dir, 'timing.png')
+    save_timing_plot(
+        timer.totals,
+        total_time,
+        timing_plot_path,
+        f'Wall-clock time per section ({FLAGS.run_group}/{exp_name}, total {total_time / 3600:.2f} h)',
+    )
+    print(f'Saved the timing plot to {timing_plot_path}')
+
+    # Save the wall-clock time (in seconds) of each section, the untimed rest, and the total.
+    timing_path = os.path.join(FLAGS.save_dir, 'timing.json')
+    with open(timing_path, 'w') as f:
+        json.dump(
+            dict(
+                sections=dict(timer.totals),
+                untimed=max(total_time - sum(timer.totals.values()), 0.0),
+                total=total_time,
+            ),
+            f,
+            indent=4,
+        )
+        f.write('\n')
+    print(f'Saved the timing totals to {timing_path}')
 
     train_logger.close()
     eval_logger.close()

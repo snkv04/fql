@@ -1,5 +1,8 @@
+import contextlib
 import os
 import tempfile
+import time
+from collections import defaultdict
 from datetime import datetime
 
 import absl.flags as flags
@@ -7,6 +10,51 @@ import ml_collections
 import numpy as np
 import wandb
 from PIL import Image, ImageEnhance
+
+
+class Timer:
+    """Accumulate the wall-clock time spent in named sections of code (`with timer('name'): ...`).
+
+    JAX dispatches computations asynchronously, so a timed section must wait for its results (e.g., with
+    `jax.block_until_ready`) for its time to be attributed to it.
+    """
+
+    def __init__(self, names=()):
+        # Start the given names at zero, so that they are logged (e.g., as CSV columns) before they are first timed.
+        self.totals = defaultdict(float, {name: 0.0 for name in names})
+
+    @contextlib.contextmanager
+    def __call__(self, name):
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.totals[name] += time.perf_counter() - start
+
+
+def save_timing_plot(totals, total_time, path, title):
+    """Save a bar graph of the wall-clock time of each timed section (and the untimed rest of `total_time`)."""
+    import matplotlib
+
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    names = list(totals) + ['other (untimed)']
+    seconds = list(totals.values()) + [max(total_time - sum(totals.values()), 0.0)]
+    hours = [s / 3600 for s in seconds]
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    bars = ax.bar(names, hours)
+    # Label each bar with its share of the total time.
+    ax.bar_label(bars, labels=[f'{100 * s / total_time:.1f}%' for s in seconds], padding=2)
+    ax.margins(y=0.1)  # Room for the labels above the bars.
+    ax.set_title(title)
+    ax.set_xlabel('Section of the training loop')
+    ax.set_ylabel('Wall-clock time (hours)')
+    ax.tick_params(axis='x', labelrotation=30)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
 
 
 class CsvLogger:
