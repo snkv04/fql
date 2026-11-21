@@ -50,6 +50,13 @@ flags.DEFINE_integer('video_episodes', 3, 'Number of video episodes for each tas
 flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 flags.DEFINE_bool('save_eval_data', True, 'Save evaluation trajectories and videos to save_dir.')
 flags.DEFINE_bool(
+    'accurate_profiling',
+    False,
+    'Whether to wait for each (asynchronous) agent update to finish inside its timed section, so that the time/update '
+    'profiling metrics include the update\'s GPU time. This makes training slightly slower. Otherwise, the GPU time of '
+    'updates is counted in the next timed section that waits for a result (e.g., act, log, or eval).',
+)
+flags.DEFINE_bool(
     'eval_with_planner',
     False,
     'Evaluate fql_plan with its planner (replanning at every step) instead of the one-step policy. Requires '
@@ -244,7 +251,9 @@ def main(_):
                 batch = train_dataset.sample(config['batch_size'])
             with timer('update'):
                 agent, update_info = update_agent(agent, batch, config, i, bc_batch=batch, critic_batch=batch)
-                jax.block_until_ready(update_info)  # Wait for the (asynchronous) update, so that it is timed here.
+                if FLAGS.accurate_profiling:
+                    # Wait for the (asynchronous) update, so that it is timed here.
+                    jax.block_until_ready(update_info)
         else:
             # Online fine-tuning.
             if i == FLAGS.offline_steps + 1 and config['agent_name'] in FQL_AGENTS:
@@ -339,7 +348,9 @@ def main(_):
                     agent, update_info = update_agent(
                         agent, batch, config, i, bc_batch=bc_batch, critic_batch=critic_batch
                     )
-                    jax.block_until_ready(update_info)  # Wait for the (asynchronous) update, so that it is timed here.
+                    if FLAGS.accurate_profiling:
+                        # Wait for the (asynchronous) update, so that it is timed here.
+                        jax.block_until_ready(update_info)
 
         # Log metrics.
         if i % FLAGS.log_interval == 0:
