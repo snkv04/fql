@@ -1,7 +1,7 @@
 """Generate and submit Slurm scripts for test-time planning evaluation (eval_plan.py) of FQL-plan runs (e.g., seeds).
 
-One script is written to slurm_scripts/generated/ for each (plan_horizon, plan_samples) pair in the cartesian product,
-and each job evaluates all of the training runs with its pair. Each job writes the results of all training runs to
+One script is written to slurm_scripts/generated/mpc_sweep/ for each (plan_horizon, plan_samples) pair in the
+cartesian product, and each job evaluates all of the training runs with its pair. Each job writes the results of all training runs to
 <first run_dir>/eval_plan/H<horizon>_N<samples>.csv, so that concurrent jobs do not overwrite each other's results.
 Jobs are assigned to the nodes in JOBS_PER_NODE in order, with at most the node's limit of jobs on each node.
 """
@@ -24,7 +24,7 @@ flags.DEFINE_bool('dry_run', False, 'Whether to only write the scripts without s
 flags.mark_flags_as_required(['run_dirs', 'plan_horizons', 'plan_samples'])
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
-SCRIPT_DIR = os.path.join(REPO_DIR, 'slurm_scripts', 'generated')
+SCRIPT_DIR = os.path.join(REPO_DIR, 'slurm_scripts', 'generated', 'mpc_sweep')
 
 # Maximum number of jobs per node, in the order that nodes are filled (each job uses 1 GPU, 4 CPUs, and 64G of memory).
 JOBS_PER_NODE = {
